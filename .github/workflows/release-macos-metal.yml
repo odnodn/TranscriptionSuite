@@ -12,6 +12,11 @@ on:
     tags:
       - "v*-mac-metal"
   workflow_dispatch:
+    inputs:
+      tag_name:
+        description: "Tag name to release (e.g. v1.2.3-mac-metal). Required when triggering manually."
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -182,6 +187,7 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ inputs.tag_name || github.ref_name }}
           generate_release_notes: true
           draft: true
           files: release-artifacts/*
