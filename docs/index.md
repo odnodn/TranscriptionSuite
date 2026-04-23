@@ -32,6 +32,11 @@
 - [API Contracts — Server](./api-contracts-server.md)
 - [Data Models — Server](./data-models-server.md)
 
+## Apple Silicon / Metal
+
+- [Diarization Pipeline](./diarization-pipeline.md) — In-depth technical walkthrough from `POST /v1/audio/transcriptions` through Parakeet ASR → Sortformer diarization → speaker merge
+- [Parakeet/Sortformer Server Prompt](./parakeet-sortformer-server-prompt.md) — AI coding-assistant prompt to build a minimal standalone Metal server with OpenAI-compatible endpoint
+
 ## Existing Documentation
 
 - [README.md](./README.md) — User-facing README with features, installation, screenshots
