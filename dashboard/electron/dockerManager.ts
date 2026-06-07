@@ -15,7 +15,7 @@
  *                 podman-compose.gpu.yml         (CDI device passthrough, Podman)
  */
 
-import { execFile, execFileSync, spawn, ChildProcess } from 'child_process';
+import { execFile, execFileSync, execSync, spawn, ChildProcess } from 'child_process';
 import { promisify } from 'util';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -32,6 +32,7 @@ import {
   resolveRootlessSocket,
   getSocketPaths,
 } from './containerRuntime.js';
+import { type WslSupport, resetWslSupportCache } from './wslDetect.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -45,13 +46,20 @@ const __dirname = path.dirname(__filename);
 // stays self-contained (same reason as the inline semverDescending() below).
 export const IMAGE_REPO = 'ghcr.io/homelab-00/transcriptionsuite-server';
 export const LEGACY_IMAGE_REPO = 'ghcr.io/homelab-00/transcriptionsuite-server-legacy';
+export const VULKAN_WSL2_IMAGE_REPO = 'ghcr.io/homelab-00/transcriptionsuite-server-vulkan-wsl2';
 
 /**
  * Select the GHCR image repo for this session based on the persisted
- * `server.useLegacyGpu` setting (Issue #83 — Pascal/Maxwell support).
+ * `server.useLegacyGpu` setting (Issue #83 — Pascal/Maxwell support) and
+ * the active runtime profile. Vulkan-WSL2 gets its own dedicated repo so
+ * its tag list never mixes with the standard or legacy-GPU variants.
  * The dashboard uses exactly one repo at a time — never mixes the two.
  */
-export function resolveImageRepo(useLegacyGpu: boolean): string {
+export function resolveImageRepo(
+  useLegacyGpu: boolean,
+  runtimeProfile?: RuntimeProfile | null,
+): string {
+  if (runtimeProfile === 'vulkan-wsl2') return VULKAN_WSL2_IMAGE_REPO;
   return useLegacyGpu ? LEGACY_IMAGE_REPO : IMAGE_REPO;
 }
 
@@ -113,6 +121,508 @@ function getStartupEventsFilePath(): string | null {
 const VULKAN_SIDECAR_IMAGE = 'ghcr.io/ggml-org/whisper.cpp:main-vulkan';
 
 /**
+ * Vulkan-WSL2 sidecar image — locally-built variant adding Mesa's `dzn`
+ * (Dozen) Vulkan-on-D3D12 ICD that the upstream `main-vulkan` image lacks.
+ * Required for AMD/Intel GPU acceleration on Windows + Docker Desktop with
+ * the WSL2 backend (GH-101 follow-up). Built via
+ * `server/docker/build-vulkan-wsl2.sh`. NOT published to GHCR for v1.3.5 —
+ * users build locally until a real-world AMD validator confirms enumeration.
+ */
+export const VULKAN_WSL2_SIDECAR_IMAGE = 'transcriptionsuite/whisper-cpp-vulkan-wsl2:latest';
+
+/**
+ * Pre-flight check for the Vulkan and Vulkan-WSL2 runtime profiles (Issue #101).
+ *
+ * Returns an actionable error message if Vulkan cannot work on this host, or
+ * `null` when the profile is viable. Pure: takes platform, an `exists`
+ * predicate, optional WSL2 detection result, and the requested profile so it
+ * can be unit-tested without a real filesystem or Docker daemon.
+ *
+ * Branches by `profile`:
+ *
+ *   `'vulkan'` (Linux DRI path — original behavior, unchanged):
+ *     1. Non-Linux — Docker Desktop on Windows/macOS runs containers in a Linux
+ *        VM that does not pass `/dev/dri` through, so the sidecar device mount
+ *        in `docker-compose.vulkan.yml` cannot resolve regardless of host GPU.
+ *     2. Linux without `/dev/dri/renderD128` — common on WSL2 or hosts without
+ *        AMD/Intel kernel driver support.
+ *
+ *   `'vulkan-wsl2'` (Windows + WSL2 GPU paravirtualization path, opt-in,
+ *   experimental — GH-101 follow-up):
+ *     1. Not Win32 — this profile only makes sense on Windows.
+ *     2. WSL2 backend not available — Docker Desktop is using Hyper-V backend
+ *        or no Docker is running.
+ *     3. GPU passthrough not detected — `/dev/dxg` or the WSL user-mode driver
+ *        bundle was not reachable from a probe container.
+ */
+export interface CheckVulkanSupportOptions {
+  platform: NodeJS.Platform;
+  exists: (p: string) => boolean;
+  wslSupport?: WslSupport;
+  profile?: 'vulkan' | 'vulkan-wsl2';
+}
+
+export function checkVulkanSupport(opts: CheckVulkanSupportOptions): string | null {
+  const { platform, exists, wslSupport, profile = 'vulkan' } = opts;
+  if (profile === 'vulkan-wsl2') {
+    if (platform !== 'win32') {
+      return (
+        'Vulkan WSL2 is an opt-in profile for Windows + Docker Desktop with the ' +
+        'WSL2 backend. Switch to the standard "Vulkan" profile (Linux only) or ' +
+        'pick another runtime.'
+      );
+    }
+    if (!wslSupport?.available) {
+      return (
+        wslSupport?.reason ??
+        'Docker Desktop is not running with the WSL2 backend. Switch to WSL2 in ' +
+          'Docker Desktop settings (or start Docker Desktop), then try again.'
+      );
+    }
+    if (!wslSupport.gpuPassthroughDetected) {
+      return (
+        wslSupport.reason ??
+        'GPU passthrough to WSL2 was not detected (/dev/dxg unreachable). ' +
+          'Ensure your Windows GPU driver is current (WDDM 3.0+) and Docker Desktop ' +
+          'is using the WSL2 backend, then try again.'
+      );
+    }
+    return null;
+  }
+
+  // profile === 'vulkan' (default — Linux DRI path)
+  if (platform !== 'linux') {
+    return (
+      'Vulkan runtime is only supported on Linux. Docker Desktop on Windows/macOS ' +
+      'runs containers in a VM without /dev/dri GPU passthrough. ' +
+      'Switch the Runtime Profile to "CPU" (or "GPU (CUDA)" with NVIDIA hardware) and try again.'
+    );
+  }
+  if (!exists('/dev/dri') || !exists('/dev/dri/renderD128')) {
+    return (
+      '/dev/dri was not found on this system (or has no render node). ' +
+      'The Vulkan runtime profile requires a DRI-capable GPU with kernel driver support. ' +
+      'This is common on WSL2 or systems without AMD/Intel GPU drivers. ' +
+      'Switch the Runtime Profile to "CPU" and try again.'
+    );
+  }
+  return null;
+}
+
+// ─── GPU Preflight (NVIDIA, Linux) ─────────────────────────────────────────
+// Runs the cheap subset of scripts/diagnose-gpu.sh at dashboard startup so
+// the GpuHealthCard can warn about misconfigurations before the container
+// is started. Pure function — all OS access is injected for testability.
+
+export interface GpuPreflightCheck {
+  name: string;
+  pass: boolean;
+  /** Documented NVIDIA fix command. Present only when pass=false. */
+  fixCommand?: string;
+  /** External URL with more context. Present only when pass=false. */
+  docsUrl?: string;
+}
+
+export interface GpuPreflightResult {
+  status: 'healthy' | 'warning' | 'unknown';
+  checks: GpuPreflightCheck[];
+}
+
+export interface GpuPreflightDeps {
+  fsExists: (path: string) => boolean;
+  readDir: (path: string) => string[];
+  /** Returns mtime (epoch seconds) or null when the path cannot be stat'd. */
+  statMtime: (path: string) => number | null;
+  /** Returns lsmod stdout (one module name per line). Empty string on failure. */
+  runLsmod: () => string;
+}
+
+const NVIDIA_DRIVER_MTIME_PATHS: readonly string[] = ['/lib/modules', '/usr/lib/modules'];
+const CDI_SPEC_PATH = '/etc/cdi/nvidia.yaml';
+
+function newestDriverMtime(statMtime: GpuPreflightDeps['statMtime']): number | null {
+  // Conservative heuristic: try a handful of distro-typical roots. The actual
+  // recursive walk lives in the IPC handler — we just take what it produces.
+  let newest: number | null = null;
+  for (const root of NVIDIA_DRIVER_MTIME_PATHS) {
+    const mt = statMtime(root);
+    if (mt !== null && (newest === null || mt > newest)) {
+      newest = mt;
+    }
+  }
+  return newest;
+}
+
+export function validateGpuPreflight(
+  platform: NodeJS.Platform,
+  deps: GpuPreflightDeps,
+): GpuPreflightResult {
+  if (platform !== 'linux') {
+    return { status: 'unknown', checks: [] };
+  }
+
+  const checks: GpuPreflightCheck[] = [];
+
+  // Check 1: CDI spec exists
+  const cdiExists = deps.fsExists(CDI_SPEC_PATH);
+  checks.push({
+    name: 'CDI spec exists',
+    pass: cdiExists,
+    fixCommand: cdiExists ? undefined : `sudo nvidia-ctk cdi generate --output=${CDI_SPEC_PATH}`,
+    docsUrl: cdiExists
+      ? undefined
+      : 'https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/cdi-support.html',
+  });
+
+  // Check 2: CDI spec newer than driver (only meaningful when both mtimes available)
+  const cdiMtime = cdiExists ? deps.statMtime(CDI_SPEC_PATH) : null;
+  const driverMtime = newestDriverMtime(deps.statMtime);
+  let cdiFresh = true;
+  if (cdiMtime !== null && driverMtime !== null && cdiMtime < driverMtime) {
+    cdiFresh = false;
+  }
+  checks.push({
+    name: 'CDI spec newer than driver',
+    pass: cdiFresh,
+    fixCommand: cdiFresh ? undefined : `sudo nvidia-ctk cdi generate --output=${CDI_SPEC_PATH}`,
+  });
+
+  // Check 3: /dev/char symlinks for major 195 (NVIDIA)
+  const charEntries = deps.fsExists('/dev/char') ? deps.readDir('/dev/char') : [];
+  const hasNvidiaSymlinks = charEntries.some((e) => e.startsWith('195:'));
+  checks.push({
+    name: '/dev/char NVIDIA symlinks',
+    pass: hasNvidiaSymlinks,
+    fixCommand: hasNvidiaSymlinks
+      ? undefined
+      : 'sudo nvidia-ctk system create-dev-char-symlinks --create-all',
+    docsUrl: hasNvidiaSymlinks
+      ? undefined
+      : 'https://github.com/NVIDIA/nvidia-container-toolkit/issues/48',
+  });
+
+  // Check 4: nvidia_uvm kernel module loaded
+  const lsmodLines = deps
+    .runLsmod()
+    .split('\n')
+    .map((l) => l.trim());
+  const uvmLoaded = lsmodLines.includes('nvidia_uvm');
+  checks.push({
+    name: 'nvidia_uvm module loaded',
+    pass: uvmLoaded,
+    fixCommand: uvmLoaded ? undefined : 'sudo modprobe nvidia_uvm',
+  });
+
+  const status: GpuPreflightResult['status'] = checks.every((c) => c.pass) ? 'healthy' : 'warning';
+
+  return { status, checks };
+}
+
+/**
+ * Real-OS wrapper around validateGpuPreflight() — used by the
+ * docker:validateGpuPreflight IPC handler. Kept separate from the pure
+ * function so tests can inject without touching fs/exec.
+ */
+export function runGpuPreflight(): GpuPreflightResult {
+  // Use the top-level ESM `fs` import. Electron's main process is bundled as
+  // ESM (electron/tsconfig.json: module=ESNext), so CommonJS `require()` is
+  // not defined at runtime in the packaged AppImage and was throwing
+  // ReferenceError here. validateGpuPreflight() itself stays pure — this
+  // impure wrapper just hands the real fs into the dep struct.
+  const deps: GpuPreflightDeps = {
+    fsExists: (p) => {
+      try {
+        return fs.existsSync(p);
+      } catch {
+        return false;
+      }
+    },
+    readDir: (p) => {
+      try {
+        return fs.readdirSync(p);
+      } catch {
+        return [];
+      }
+    },
+    statMtime: (p) => {
+      try {
+        // For driver-module roots, walk one level deep and find the newest
+        // nvidia*.ko* file mtime. (The bash diagnose script does the same.)
+        // For everything else, just stat the path itself.
+        if (p === '/lib/modules' || p === '/usr/lib/modules') {
+          return newestNvidiaKoMtime(p, fs);
+        }
+        return Math.floor(fs.statSync(p).mtimeMs / 1000);
+      } catch {
+        return null;
+      }
+    },
+    runLsmod: () => {
+      try {
+        // lsmod is column-formatted: "Module  Size  Used by". The pure
+        // function expects one module name per line. Extract column 1
+        // and skip the header row.
+        const raw = execSync('lsmod', { timeout: 2000, encoding: 'utf8' });
+        const lines = raw.split('\n');
+        return lines
+          .slice(1) // drop header
+          .map((line) => line.split(/\s+/)[0] ?? '')
+          .filter((name) => name.length > 0)
+          .join('\n');
+      } catch {
+        return '';
+      }
+    },
+  };
+
+  return validateGpuPreflight(process.platform, deps);
+}
+
+/**
+ * One row parsed from `[STATUS] #N  Title  detail` in the diagnostic log.
+ * `suggestedCommand` is extracted from `regenerate with: <cmd>` or `fix: <cmd>`
+ * fragments inside `detail`, so the UI can render a copyable command without
+ * the user having to scrape the log themselves.
+ */
+export interface DiagnosticIssue {
+  status: 'PASS' | 'WARN' | 'FAIL' | 'INFO';
+  checkNumber: number;
+  title: string;
+  detail: string;
+  suggestedCommand?: string;
+}
+
+export interface DiagnosticSummary {
+  passCount: number;
+  warnCount: number;
+  failCount: number;
+  /** Only WARN + FAIL rows — what the UI surfaces. */
+  issues: DiagnosticIssue[];
+  /** True when the canonical `PASS: N WARN: N FAIL: N` summary block was found. */
+  parsed: boolean;
+}
+
+export interface RunGpuDiagnosticResult {
+  status: 'completed' | 'unsupported' | 'script-missing';
+  /** Absolute path to the log file the script writes (when status=completed). */
+  logPath?: string;
+  /** Resolved script path (always present for status=completed or script-missing). */
+  scriptPath?: string;
+  /** The exact command string the user could run themselves. */
+  manualCommand?: string;
+  /** Parsed log summary (when status=completed). */
+  summary?: DiagnosticSummary;
+  /** Bash exit code (0 = OK / WARN; non-zero = FAIL). Present when status=completed. */
+  exitCode?: number;
+}
+
+function resolveDiagnosticScriptPath(): string {
+  // Packaged: <app>/resources/scripts/diagnose-gpu.sh
+  // Dev: <repo>/scripts/diagnose-gpu.sh (relative to dist-electron/dockerManager.js)
+  if (app.isPackaged) {
+    return path.join(process.resourcesPath, 'scripts', 'diagnose-gpu.sh');
+  }
+  // __dirname at runtime is dist-electron/; the repo's scripts/ is two levels up.
+  return path.resolve(__dirname, '..', '..', 'scripts', 'diagnose-gpu.sh');
+}
+
+// Each diagnostic check line has shape:
+//   [STATUS] #N  Title (≤50 col, padded)  detail
+// `printf '[%s] #%-2s %-50s %s\n'` in the bash script — the %-50s padding
+// guarantees ≥2 spaces between title and detail for every title currently
+// emitted by scripts/diagnose-gpu.sh (max title ~36 chars; budget is 50).
+// We deliberately DO NOT support titles that hit the 50-char budget exactly:
+// using `\s+` instead of `\s{2,}` would let the lazy title group stop at
+// the first space and break titles that contain spaces themselves.
+const DIAG_ROW_RE = /^\[(PASS|WARN|FAIL|INFO)\]\s+#(\d+)\s+(.+?)\s{2,}(.*)$/;
+// Pull the actionable command out of detail strings like
+//   "CDI spec is older than driver modules — regenerate with: sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml"
+//   "missing — fix: sudo nvidia-ctk system create-dev-char-symlinks --create-all (also add udev rule per …)"
+// Stops at " (" to drop trailing parentheticals; otherwise consumes to EOL.
+const DIAG_CMD_RE = /\b(?:regenerate with|fix):\s+(.+?)(?:\s+\([^)]*\)\s*$|\s*$)/i;
+const DIAG_SUMMARY_RE = /^PASS:\s*(\d+)\s+WARN:\s*(\d+)\s+FAIL:\s*(\d+)\s*$/m;
+
+/**
+ * Pure parser for `scripts/diagnose-gpu.sh` log output. Exported so the unit
+ * tests can hit it without spawning bash. WARN and FAIL rows are surfaced;
+ * PASS/INFO rows are counted only.
+ */
+export function parseDiagnosticLog(content: string): DiagnosticSummary {
+  const issues: DiagnosticIssue[] = [];
+  let passCount = 0;
+  let warnCount = 0;
+  let failCount = 0;
+  let parsed = false;
+
+  const summaryMatch = content.match(DIAG_SUMMARY_RE);
+  if (summaryMatch) {
+    parsed = true;
+    passCount = Number(summaryMatch[1]);
+    warnCount = Number(summaryMatch[2]);
+    failCount = Number(summaryMatch[3]);
+  }
+
+  for (const rawLine of content.split('\n')) {
+    const m = DIAG_ROW_RE.exec(rawLine);
+    if (!m) continue;
+    const [, status, num, title, detail] = m as unknown as [
+      string,
+      DiagnosticIssue['status'],
+      string,
+      string,
+      string,
+    ];
+    if (status === 'PASS' || status === 'INFO') continue;
+    const cmdMatch = DIAG_CMD_RE.exec(detail);
+    issues.push({
+      status: status as DiagnosticIssue['status'],
+      checkNumber: Number(num),
+      title: title.trim(),
+      detail: detail.trim(),
+      suggestedCommand: cmdMatch ? cmdMatch[1].trim() : undefined,
+    });
+  }
+
+  // Fallback when the canonical Summary block is missing: count what we saw
+  // ourselves so the modal still shows something useful.
+  if (!parsed) {
+    for (const rawLine of content.split('\n')) {
+      const m = DIAG_ROW_RE.exec(rawLine);
+      if (!m) continue;
+      const status = m[1];
+      if (status === 'PASS') passCount++;
+      else if (status === 'WARN') warnCount++;
+      else if (status === 'FAIL') failCount++;
+    }
+  }
+
+  return { passCount, warnCount, failCount, issues, parsed };
+}
+
+export async function runGpuDiagnostic(): Promise<RunGpuDiagnosticResult> {
+  if (process.platform !== 'linux') {
+    return { status: 'unsupported' };
+  }
+  const scriptPath = resolveDiagnosticScriptPath();
+  if (!fs.existsSync(scriptPath)) {
+    return {
+      status: 'script-missing',
+      scriptPath,
+      manualCommand: `bash ${scriptPath}`,
+    };
+  }
+
+  // Per-user diagnostics directory inside the Electron userData root, NOT in
+  // multi-user /tmp. Restrictive 0o700 dir + O_EXCL+0o600 file (the 'wx' flag)
+  // mean only this user can read or pre-create the log — closes the symlink-
+  // attack surface flagged by CodeQL js/insecure-temporary-file. Random suffix
+  // on the filename makes same-second back-to-back clicks not collide on the
+  // O_EXCL check.
+  const dir = path.join(app.getPath('userData'), 'gpu-diagnostics');
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const ts = new Date().toISOString().replace(/[-:.]/g, '').slice(0, 15);
+  const suffix = crypto.randomBytes(3).toString('hex');
+  const logPath = path.join(dir, `gpu-diagnostic-${ts}-${suffix}.log`);
+
+  // Wait for the child to exit so the renderer can show parsed results in
+  // one go. The script is read-only and bounded (~11 cheap checks, no docker
+  // pulls — image-pull guard is already inside the script). Typical wall
+  // time on a healthy host is <2s; the renderer shows a "Running…" spinner
+  // while we await.
+  //
+  // Open the fd inside the Promise so a synchronous open() failure or a
+  // 'error' event from spawn (e.g. bash not on PATH) still hits the cleanup
+  // path — out-of-scope of the original closeSync block, which only ran on
+  // 'exit'. Otherwise an 'error' before 'exit' would leak the fd.
+  const exitCode: number = await new Promise((resolve) => {
+    let out: number | undefined;
+    try {
+      out = fs.openSync(logPath, 'wx', 0o600);
+    } catch {
+      resolve(-1);
+      return;
+    }
+    const cleanup = (): void => {
+      if (out === undefined) return;
+      try {
+        fs.closeSync(out);
+      } catch {
+        // Best-effort — stdio inheritance may have already closed it.
+      }
+      out = undefined;
+    };
+    const child = spawn('bash', [scriptPath], {
+      stdio: ['ignore', out, out],
+      cwd: dir,
+    });
+    child.on('exit', (code) => {
+      cleanup();
+      resolve(code ?? 0);
+    });
+    child.on('error', () => {
+      cleanup();
+      resolve(-1);
+    });
+  });
+
+  let summary: DiagnosticSummary;
+  try {
+    const content = await fs.promises.readFile(logPath, 'utf-8');
+    summary = parseDiagnosticLog(content);
+  } catch {
+    summary = { passCount: 0, warnCount: 0, failCount: 0, issues: [], parsed: false };
+  }
+
+  return {
+    status: 'completed',
+    logPath,
+    scriptPath,
+    manualCommand: `bash ${scriptPath}`,
+    summary,
+    exitCode,
+  };
+}
+
+/**
+ * Recursively walk a kernel-module root looking for nvidia*.ko[.zst] files
+ * and return the newest mtime (epoch seconds), or null if none found.
+ * Bounded depth to avoid runaway walks.
+ */
+function newestNvidiaKoMtime(root: string, fs: typeof import('fs')): number | null {
+  let newest: number | null = null;
+  const stack: Array<{ path: string; depth: number }> = [{ path: root, depth: 0 }];
+  const MAX_DEPTH = 6;
+  while (stack.length > 0) {
+    const entry = stack.pop();
+    if (!entry || entry.depth > MAX_DEPTH) continue;
+    let children: string[];
+    try {
+      children = fs.readdirSync(entry.path);
+    } catch {
+      continue;
+    }
+    for (const name of children) {
+      const childPath = `${entry.path}/${name}`;
+      let stat;
+      try {
+        stat = fs.statSync(childPath);
+      } catch {
+        continue;
+      }
+      if (stat.isDirectory()) {
+        stack.push({ path: childPath, depth: entry.depth + 1 });
+      } else if (/^nvidia.*\.ko(\..*)?$/.test(name)) {
+        const epoch = Math.floor(stat.mtimeMs / 1000);
+        if (newest === null || epoch > newest) {
+          newest = epoch;
+        }
+      }
+    }
+  }
+  return newest;
+}
+
+/**
  * Resolve compose directory.
  *
  * In dev mode the repo's server/docker directory is used directly.
@@ -125,23 +635,21 @@ const VULKAN_SIDECAR_IMAGE = 'ghcr.io/ggml-org/whisper.cpp:main-vulkan';
  * directory that the compose file defaults reference.
  */
 function resolveComposeDir(): string {
-  if (!app.isPackaged) {
-    return path.resolve(__dirname, '../../server/docker');
-  }
+  // In dev mode, source files come from the repo; when packaged, from the bundle.
+  // Either way, we write to AppData so that .env never lands in the source tree.
+  const sourceDir = app.isPackaged
+    ? path.join(process.resourcesPath, 'docker')
+    : path.resolve(__dirname, '../../server/docker');
 
-  const bundledDir = path.join(process.resourcesPath, 'docker');
   const userDataDir = path.join(app.getPath('appData'), 'TranscriptionSuite');
   app.setPath('userData', userDataDir);
   const writableDir = path.join(userDataDir, 'docker');
 
-  // Ensure writable target exists
   fs.mkdirSync(writableDir, { recursive: true });
 
-  // Copy / refresh compose files from the bundle into the writable dir
-  for (const file of fs.readdirSync(bundledDir)) {
-    const src = path.join(bundledDir, file);
+  for (const file of fs.readdirSync(sourceDir)) {
+    const src = path.join(sourceDir, file);
     const dst = path.join(writableDir, file);
-    // Only copy files (not directories)
     if (fs.statSync(src).isFile()) {
       fs.copyFileSync(src, dst);
     }
@@ -169,9 +677,63 @@ function getComposeDir(): string {
 }
 
 // Keep in sync with src/types/runtime.ts (canonical) and src/types/electron.d.ts
-/** Runtime profile: GPU (NVIDIA CUDA), Vulkan (AMD/Intel GPU), CPU-only, or Metal (Apple Silicon MLX) */
-export type RuntimeProfile = 'gpu' | 'cpu' | 'vulkan' | 'metal';
+/**
+ * Runtime profile: GPU (NVIDIA CUDA), Vulkan (AMD/Intel GPU on Linux DRI),
+ * Vulkan-WSL2 (AMD/Intel GPU on Windows + Docker Desktop with WSL2 backend —
+ * experimental, opt-in, GH-101 follow-up), CPU-only, or Metal (Apple Silicon MLX).
+ */
+export type RuntimeProfile = 'gpu' | 'cpu' | 'vulkan' | 'vulkan-wsl2' | 'metal';
 export type HfTokenDecision = 'unset' | 'provided' | 'skipped';
+
+const RUNTIME_PROFILE_VALUES: readonly RuntimeProfile[] = [
+  'gpu',
+  'cpu',
+  'vulkan',
+  'vulkan-wsl2',
+  'metal',
+];
+
+function isRuntimeProfile(value: unknown): value is RuntimeProfile {
+  return typeof value === 'string' && (RUNTIME_PROFILE_VALUES as readonly string[]).includes(value);
+}
+
+/**
+ * Read the persisted `server.runtimeProfile` from the electron-store JSON file
+ * on disk. Returns null when the file is missing or the key is absent/invalid.
+ *
+ * The persisted value is the durable source of truth for the user's selected
+ * runtime. Renderer callers (App / SessionView / ServerView) each hydrate their
+ * own copy once on mount and can drift stale, so the start path must re-read
+ * this at launch time rather than trust whatever the renderer last sent — see
+ * `resolveEffectiveRuntimeProfile`.
+ */
+export function readRuntimeProfileFromStore(): RuntimeProfile | null {
+  try {
+    const storePath = path.join(app.getPath('userData'), 'dashboard-config.json');
+    const raw = fs.readFileSync(storePath, 'utf8');
+    const data = JSON.parse(raw) as Record<string, unknown>;
+    const value = data['server.runtimeProfile'];
+    return isRuntimeProfile(value) ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Resolve the runtime profile to actually launch with. Prefers the persisted
+ * store value (durable user intent) over the renderer-supplied request, which
+ * may be a stale mount-time copy. Falls back to the request only when the store
+ * has no valid value (e.g. first run before any persist).
+ *
+ * This is the single funnel point that prevents the container from launching
+ * under a runtime the user has already changed away from.
+ */
+export function resolveEffectiveRuntimeProfile(
+  requested: RuntimeProfile,
+  persisted: RuntimeProfile | null,
+): RuntimeProfile {
+  return persisted ?? requested;
+}
 
 const VOLUME_NAMES = {
   data: 'transcriptionsuite-data',
@@ -774,6 +1336,11 @@ export function composeFileArgs(
     files.push('docker-compose.vulkan.yml');
   }
 
+  // vulkan-wsl2: whisper-server.exe runs natively on Windows (no AVX2 in the
+  // host CPU means the containerised whisper-server cannot start).  Docker only
+  // handles the main transcription backend; it reaches the native exe via
+  // host.docker.internal:8080.  No sidecar overlay needed.
+
   // Flatten into compose args
   return files.flatMap((f) => ['-f', f]);
 }
@@ -824,14 +1391,17 @@ let detectedGpuMode: 'cdi' | 'legacy' | null = null;
 async function exec(
   cmd: string,
   args: string[],
-  opts?: { cwd?: string; env?: Record<string, string> },
+  opts?: { cwd?: string; env?: Record<string, string>; timeoutMs?: number },
 ): Promise<string> {
   try {
     const { stdout } = await execFileAsync(cmd, args, {
       cwd: opts?.cwd,
       env: buildProcessEnv(opts?.env, detectedRuntimeKind ?? undefined),
       maxBuffer: 10 * 1024 * 1024, // 10MB
-      timeout: 120_000, // 2 minutes
+      // `?? 120_000` would treat an explicit `0` as "instant timeout" (execFile
+      // semantics). Coerce 0/negative to the 2-minute default so the helper's
+      // contract matches the natural "0 means no override" reading.
+      timeout: opts?.timeoutMs && opts.timeoutMs > 0 ? opts.timeoutMs : 120_000,
     });
     return stdout.trim();
   } catch (err: any) {
@@ -925,14 +1495,30 @@ let pullProcess: ChildProcess | null = null;
 /** Active sidecar pull process — independent from main image pull */
 let sidecarPullProcess: ChildProcess | null = null;
 
+/** Pending retry timer for transient pull-error backoff (Issue #103). */
+let pullRetryTimer: NodeJS.Timeout | null = null;
+
+/**
+ * True if the active `pullImage` cycle was cancelled mid-flight (in-attempt
+ * or in-backoff). Reset to false at the start of each new `pullImage` call.
+ */
+let pullCancelled = false;
+
+/**
+ * Resolver of the in-flight retry-backoff promise; held so `cancelPull()` can
+ * wake the loop immediately instead of waiting for the timer to elapse.
+ */
+let pullBackoffResolve: (() => void) | null = null;
+
 /**
  * List local Docker images matching our repo.
  *
  * The repo URL is chosen by the persisted `server.useLegacyGpu` setting
- * (Issue #83). Only one repo is scanned per call — never both.
+ * (Issue #83) and the active runtime profile. Only one repo is scanned per
+ * call — never both.
  */
 async function listImages(): Promise<DockerImage[]> {
-  const imageRepo = resolveImageRepo(readUseLegacyGpuFromStore());
+  const imageRepo = resolveImageRepo(readUseLegacyGpuFromStore(), readRuntimeProfileFromStore());
   const parseLegacyFormat = (output: string): DockerImage[] => {
     return output
       .split('\n')
@@ -1102,6 +1688,120 @@ async function listImages(): Promise<DockerImage[]> {
   }
 }
 
+// ─── Pull error classification & retry policy (Issue #103) ──────────────────
+
+/**
+ * Hard cap on `pullImage` attempts (1 initial + 2 retries). The image is
+ * 5–10 GB, so longer cycles add minutes for no benefit on a sub-second blip.
+ */
+const MAX_PULL_ATTEMPTS = 3;
+
+/** Backoff (ms) before each retry attempt. Length is `MAX_PULL_ATTEMPTS - 1`. */
+const PULL_BACKOFF_MS = [2000, 5000];
+
+const TRANSIENT_PULL_SIGNALS = [
+  'eof',
+  'connection reset',
+  'connection refused',
+  'i/o timeout',
+  'context deadline exceeded',
+  'tls handshake',
+  'temporary failure',
+  'unexpected eof',
+  'no route to host',
+  'no such host', // DNS lookup failure — distinct from "no such image"
+  'network is unreachable',
+];
+
+const AUTH_PULL_SIGNALS = ['unauthorized', 'denied', 'authentication required', ' 401', ' 403'];
+
+// Note: do NOT add 'no such' here — it collides with DNS transients
+// like 'no such host'. The signals below are unambiguous for not-found.
+const NOT_FOUND_PULL_SIGNALS = ['manifest unknown', 'not found', ' 404'];
+
+const DISK_FULL_PULL_SIGNALS = ['no space left', 'enospc', 'disk full'];
+
+export type PullErrorKind =
+  | 'transient'
+  | 'auth'
+  | 'not_found'
+  | 'disk_full'
+  | 'unknown'
+  | 'cancelled';
+
+export interface ClassifiedPullError {
+  kind: PullErrorKind;
+  friendly: string;
+  retriable: boolean;
+}
+
+/**
+ * Classify a pull failure into a known kind and produce a one-sentence
+ * user-facing message. Pure function — no side effects, reads no module state.
+ *
+ * Issue #103: a transient network EOF on the GHCR manifest used to bubble up
+ * to the renderer as raw Go-style stderr. This classifier maps it to a short
+ * message and a `retriable` flag so the caller can decide to retry. Order of
+ * checks matters: more-specific permanent classes win over the transient
+ * catch-all so an `"unauthorized: ... eof"` stderr is NOT retried.
+ */
+export function classifyPullError(
+  stderr: string,
+  code: number | null,
+  cancelled = false,
+): ClassifiedPullError {
+  if (cancelled) {
+    return { kind: 'cancelled', friendly: 'Pull cancelled.', retriable: false };
+  }
+  const haystack = stderr.toLowerCase();
+  if (AUTH_PULL_SIGNALS.some((s) => haystack.includes(s))) {
+    return {
+      kind: 'auth',
+      friendly:
+        'Registry rejected the request. The image may be private or your runtime needs login.',
+      retriable: false,
+    };
+  }
+  if (NOT_FOUND_PULL_SIGNALS.some((s) => haystack.includes(s))) {
+    return {
+      kind: 'not_found',
+      friendly: 'Image tag not found on the registry.',
+      retriable: false,
+    };
+  }
+  if (DISK_FULL_PULL_SIGNALS.some((s) => haystack.includes(s))) {
+    return {
+      kind: 'disk_full',
+      friendly: 'Not enough disk space to pull the image.',
+      retriable: false,
+    };
+  }
+  if (TRANSIENT_PULL_SIGNALS.some((s) => haystack.includes(s))) {
+    return {
+      kind: 'transient',
+      friendly:
+        'Network connection interrupted while downloading. Check your internet and try again.',
+      retriable: true,
+    };
+  }
+  // No signal AND no exit code AND not cancelled → process died unexpectedly.
+  // Treat as a transient blip; the retry loop will surface a friendly error
+  // if it persists across all attempts.
+  if (code === null) {
+    return {
+      kind: 'transient',
+      friendly:
+        'Network connection interrupted while downloading. Check your internet and try again.',
+      retriable: true,
+    };
+  }
+  return {
+    kind: 'unknown',
+    friendly: `Pull failed (exit code ${code}).`,
+    retriable: false,
+  };
+}
+
 /**
  * Pull an image tag from the registry.
  * Uses spawn instead of exec so the process can be cancelled.
@@ -1109,56 +1809,137 @@ async function listImages(): Promise<DockerImage[]> {
  * Pulls from the repo selected by the persisted `server.useLegacyGpu` setting
  * (Issue #83). A mid-session toggle requires a restart to take effect — this
  * is by design (Never rule: "Dashboard uses one image-repo at a time").
+ *
+ * Issue #103: bounded retry on transient (network-class) failures, with the
+ * final error translated into a one-sentence friendly message before reject.
+ * Retries fire only when `classifyPullError` returns `retriable: true`.
  */
 async function pullImage(tag: string): Promise<string> {
-  const imageRepo = resolveImageRepo(readUseLegacyGpuFromStore());
+  const imageRepo = resolveImageRepo(readUseLegacyGpuFromStore(), readRuntimeProfileFromStore());
   const bin = await runtimeBin();
-  return new Promise((resolve, reject) => {
-    cancelPull(); // kill any existing pull first
+  const env = buildProcessEnv(undefined, detectedRuntimeKind ?? undefined);
 
-    const proc = spawn(bin, ['pull', `${imageRepo}:${tag}`], {
-      stdio: ['ignore', 'pipe', 'pipe'],
-      env: buildProcessEnv(undefined, detectedRuntimeKind ?? undefined),
-    });
-    pullProcess = proc;
-
-    let stdout = '';
-    let stderr = '';
-
-    proc.stdout?.on('data', (data: Buffer) => {
-      stdout += data.toString();
-    });
-    proc.stderr?.on('data', (data: Buffer) => {
-      stderr += data.toString();
-    });
-
-    proc.on('close', (code) => {
-      if (pullProcess === proc) pullProcess = null;
-      if (code === 0) {
-        resolve(stdout.trim());
-      } else {
-        reject(new Error(stderr.trim() || `Pull exited with code ${code}`));
-      }
-    });
-
-    proc.on('error', (err) => {
-      if (pullProcess === proc) pullProcess = null;
-      reject(err);
-    });
-  });
-}
-
-/**
- * Cancel an in-progress image pull.
- * Returns true if a pull was actually cancelled.
- */
-function cancelPull(): boolean {
+  // Reset cycle state and stamp out any zombie prior process / retry timer.
+  if (pullRetryTimer) {
+    clearTimeout(pullRetryTimer);
+    pullRetryTimer = null;
+  }
   if (pullProcess) {
     pullProcess.kill('SIGTERM');
     pullProcess = null;
-    return true;
   }
-  return false;
+  pullBackoffResolve = null;
+  pullCancelled = false;
+
+  type AttemptResult =
+    | { ok: true; stdout: string }
+    | { ok: false; code: number | null; stderr: string };
+
+  const runOne = (): Promise<AttemptResult> =>
+    new Promise((resolve) => {
+      const proc = spawn(bin, ['pull', `${imageRepo}:${tag}`], {
+        stdio: ['ignore', 'pipe', 'pipe'],
+        env,
+      });
+      pullProcess = proc;
+
+      let stdout = '';
+      let stderr = '';
+
+      proc.stdout?.on('data', (data: Buffer) => {
+        stdout += data.toString();
+      });
+      proc.stderr?.on('data', (data: Buffer) => {
+        stderr += data.toString();
+      });
+
+      proc.on('close', (code) => {
+        if (pullProcess === proc) pullProcess = null;
+        if (code === 0) {
+          resolve({ ok: true, stdout: stdout.trim() });
+        } else {
+          resolve({ ok: false, code, stderr: stderr.trim() });
+        }
+      });
+
+      proc.on('error', (err) => {
+        if (pullProcess === proc) pullProcess = null;
+        // Spawn-time errors (e.g. ENOENT for missing runtime) come through
+        // here. Surface as a null-code failure so the classifier handles it.
+        resolve({ ok: false, code: null, stderr: err.message });
+      });
+    });
+
+  for (let attempt = 1; attempt <= MAX_PULL_ATTEMPTS; attempt++) {
+    // No top-of-loop cancel check here: pullCancelled is reset to false above
+    // and the loop has no yield points outside of the awaited backoff (which
+    // is followed by its own post-await check). cancelPull() can only flip
+    // the flag during an await, and every await already has a paired check.
+    const result = await runOne();
+
+    if (pullCancelled) {
+      throw new Error('Pull cancelled.');
+    }
+
+    if (result.ok === true) {
+      return result.stdout;
+    }
+
+    const { stderr: failureStderr, code: failureCode } = result;
+    const classified = classifyPullError(failureStderr, failureCode);
+    const isLastAttempt = attempt >= MAX_PULL_ATTEMPTS;
+
+    if (!classified.retriable || isLastAttempt) {
+      console.warn(
+        `[DockerManager] pullImage: final failure (${classified.kind}) after ${attempt} attempt(s). Raw stderr:\n${failureStderr}`,
+      );
+      throw new Error(classified.friendly);
+    }
+
+    const backoff = PULL_BACKOFF_MS[attempt - 1] ?? 5000;
+    console.warn(
+      `[DockerManager] pullImage: attempt ${attempt}/${MAX_PULL_ATTEMPTS} failed (${classified.kind}); retrying in ${backoff}ms`,
+    );
+
+    // Wait for backoff OR cancellation, whichever comes first.
+    await new Promise<void>((resolve) => {
+      pullBackoffResolve = resolve;
+      pullRetryTimer = setTimeout(() => {
+        pullRetryTimer = null;
+        pullBackoffResolve = null;
+        resolve();
+      }, backoff);
+    });
+
+    if (pullCancelled) {
+      throw new Error('Pull cancelled.');
+    }
+  }
+  // Loop body always returns or throws — this is a safety net for the type
+  // checker; reaching it would be a bug.
+  throw new Error('Pull failed.');
+}
+
+/**
+ * Cancel an in-progress image pull (active spawn or pending retry backoff).
+ * Returns true if anything was cancelled.
+ */
+function cancelPull(): boolean {
+  const wasActive = pullProcess !== null || pullRetryTimer !== null;
+  pullCancelled = true;
+  if (pullRetryTimer) {
+    clearTimeout(pullRetryTimer);
+    pullRetryTimer = null;
+  }
+  if (pullBackoffResolve) {
+    pullBackoffResolve();
+    pullBackoffResolve = null;
+  }
+  if (pullProcess) {
+    pullProcess.kill('SIGTERM');
+    pullProcess = null;
+  }
+  return wasActive;
 }
 
 /**
@@ -1247,10 +2028,11 @@ function isSidecarPulling(): boolean {
  * Remove a local image by tag.
  *
  * Targets the repo selected by the persisted `server.useLegacyGpu` setting
- * (Issue #83) — removing from the other repo requires toggling first.
+ * (Issue #83) and the active runtime profile — removing from another repo
+ * requires switching profile first.
  */
 async function removeImage(tag: string): Promise<string> {
-  const imageRepo = resolveImageRepo(readUseLegacyGpuFromStore());
+  const imageRepo = resolveImageRepo(readUseLegacyGpuFromStore(), readRuntimeProfileFromStore());
   return exec(await runtimeBin(), ['rmi', `${imageRepo}:${tag}`]);
 }
 
@@ -1280,6 +2062,51 @@ async function getContainerStatus(): Promise<ContainerStatus> {
   }
 }
 
+// GH-125: NeMo models (Parakeet/Canary/Nemotron-speech) need a GPU to be
+// practical and pull in the heavy `nemo` extra that broke first-run CPU installs.
+// Detection mirrors server/backend/core/stt/backends/factory.py and
+// src/services/modelCapabilities.ts — the Electron main process cannot import the
+// renderer-side service, so keep these in sync.
+const CPU_FALLBACK_MAIN_MODEL = 'Systran/faster-whisper-medium';
+
+export function isNemoModelName(model: string | undefined | null): boolean {
+  if (!model) return false;
+  const normalized = model.trim().toLowerCase();
+  return (
+    normalized.startsWith('nvidia/parakeet') ||
+    normalized.startsWith('nvidia/canary') ||
+    normalized.startsWith('nvidia/nemotron-speech')
+  );
+}
+
+export interface CpuModelDefaults {
+  mainTranscriberModel?: string;
+  installNemo?: boolean;
+  installWhisper?: boolean;
+}
+
+/**
+ * On the CPU profile, substitute a faster-whisper main model when a NeMo model
+ * was selected so CPU launches never install or run NeMo (GH-125). This is the
+ * authoritative guard: every start path funnels through startContainer, so it
+ * also covers the first-run auto-detect path where the UI-side reset in
+ * ServerView may not have fired yet. A no-op for non-CPU profiles or non-NeMo
+ * models — values pass through unchanged.
+ */
+export function applyCpuModelDefaults(
+  profile: RuntimeProfile,
+  opts: CpuModelDefaults,
+): CpuModelDefaults {
+  if (profile !== 'cpu' || !isNemoModelName(opts.mainTranscriberModel)) {
+    return opts;
+  }
+  return {
+    mainTranscriberModel: CPU_FALLBACK_MAIN_MODEL,
+    installNemo: false,
+    installWhisper: true,
+  };
+}
+
 /**
  * Start the container via docker compose with layered compose files.
  * @param options - Container start options including mode, runtime profile, and optional TLS env.
@@ -1287,7 +2114,7 @@ async function getContainerStatus(): Promise<ContainerStatus> {
 async function startContainer(options: StartContainerOptions): Promise<string> {
   const {
     mode,
-    runtimeProfile,
+    runtimeProfile: requestedRuntimeProfile,
     imageTag,
     tlsEnv,
     hfToken,
@@ -1300,6 +2127,25 @@ async function startContainer(options: StartContainerOptions): Promise<string> {
     diarizationModel,
     whispercppModel,
   } = options;
+
+  // The persisted `server.runtimeProfile` is the source of truth for what the
+  // user has selected. Renderer start surfaces (App / SessionView / ServerView)
+  // each read it once on mount and can hold a stale copy, so a container could
+  // otherwise launch under a profile the user already changed away from (e.g.
+  // started under Vulkan, switched to GPU, never restarted). Re-read at launch
+  // time and prefer the persisted value; the renderer arg is only a fallback
+  // for the first run before anything has been persisted.
+  const persistedRuntimeProfile = readRuntimeProfileFromStore();
+  const runtimeProfile = resolveEffectiveRuntimeProfile(
+    requestedRuntimeProfile,
+    persistedRuntimeProfile,
+  );
+  if (persistedRuntimeProfile && persistedRuntimeProfile !== requestedRuntimeProfile) {
+    console.warn(
+      `[DockerManager] runtimeProfile mismatch — renderer requested "${requestedRuntimeProfile}" ` +
+        `but persisted store has "${persistedRuntimeProfile}"; launching with the persisted value.`,
+    );
+  }
 
   // Guard: bail early with a human-readable message if compose is not available.
   if (_composeAvailable === false) {
@@ -1331,20 +2177,40 @@ async function startContainer(options: StartContainerOptions): Promise<string> {
     }
   }
 
-  // Pre-flight Vulkan validation: verify /dev/dri and a render node exist
-  // before Docker tries to mount them (docker-compose.vulkan.yml: devices:
-  // - /dev/dri:/dev/dri).  On systems without DRI (WSL2, missing GPU drivers),
-  // Docker fails with a cryptic "error gathering device information" message.
-  // Mirrors the checkGpu() detection logic — both require directory + render node.
-  if (runtimeProfile === 'vulkan' && process.platform === 'linux') {
-    const fs = await import('fs');
-    if (!fs.existsSync('/dev/dri') || !fs.existsSync('/dev/dri/renderD128')) {
+  // Pre-flight: Linux Vulkan (DRI device passthrough).
+  if (runtimeProfile === 'vulkan') {
+    const vulkanError = checkVulkanSupport({
+      platform: process.platform,
+      exists: (p) => fs.existsSync(p),
+      profile: 'vulkan',
+    });
+    if (vulkanError) {
+      throw new Error(vulkanError);
+    }
+  }
+
+  // Pre-flight: Windows vulkan-wsl2 (native whisper-server.exe, no AVX2 needed).
+  // Docker Desktop with WSL2 backend is still required for the main backend
+  // container; only the whisper sidecar is replaced by the native exe.
+  if (runtimeProfile === 'vulkan-wsl2') {
+    if (process.platform !== 'win32') {
       throw new Error(
-        '/dev/dri was not found on this system (or has no render node). ' +
-          'The Vulkan runtime profile requires a DRI-capable GPU with kernel driver support. ' +
-          'This is common on WSL2 or systems without AMD/Intel GPU drivers. ' +
-          'Switch the Runtime Profile to "CPU" and try again.',
+        'The vulkan-wsl2 profile is only supported on Windows. ' +
+          'Switch to the standard "Vulkan" profile on Linux.',
       );
+    }
+    const gpuInfo = await checkGpu();
+    if (!gpuInfo.wslSupport?.available) {
+      throw new Error(
+        gpuInfo.wslSupport?.reason ??
+          'Docker Desktop is not running with the WSL2 backend. ' +
+            'Switch to WSL2 in Docker Desktop settings, then try again.',
+      );
+    }
+    const exePath = getWhisperServerExePath();
+    if (!fs.existsSync(exePath)) {
+      console.log('[DockerManager] whisper-server.exe missing — downloading from GitHub...');
+      await downloadWhisperServerExe();
     }
   }
 
@@ -1355,7 +2221,7 @@ async function startContainer(options: StartContainerOptions): Promise<string> {
   // and compose's IMAGE_REPO env all agree (Issue #83). The setting is read
   // from electron-store at start time, not on every subsequent operation.
   const useLegacyGpu = readUseLegacyGpuFromStore();
-  const imageRepoForSession = resolveImageRepo(useLegacyGpu);
+  const imageRepoForSession = resolveImageRepo(useLegacyGpu, runtimeProfile);
   composeEnv['IMAGE_REPO'] = imageRepoForSession;
 
   // Prefer a local image tag for dev workflows when no explicit tag is provided.
@@ -1395,10 +2261,27 @@ async function startContainer(options: StartContainerOptions): Promise<string> {
     composeEnv['TLS_ENABLED'] = 'false';
   }
 
-  // For CPU mode, force CUDA invisible so the server deterministically uses CPU
+  // For CPU mode, force CUDA invisible so the server deterministically uses CPU,
+  // and select the cpu PyTorch wheels so the bootstrap skips the multi-GB CUDA
+  // wheels a CPU-only host can't use (GH-125). Set on composeEnv only (not
+  // persisted to .env) so a later GPU launch is unaffected.
   if (runtimeProfile === 'cpu') {
     composeEnv['CUDA_VISIBLE_DEVICES'] = '';
+    composeEnv['PYTORCH_VARIANT'] = 'cpu';
   }
+
+  // GH-125: guarantee CPU launches never request a NeMo model. The UI-side
+  // reset can be bypassed on first-run auto-detect (profile is set before the
+  // model selection hydrates), so enforce the faster-whisper substitution here
+  // at the single funnel all start paths pass through. No-op otherwise.
+  const cpuDefaults = applyCpuModelDefaults(runtimeProfile, {
+    mainTranscriberModel,
+    installNemo,
+    installWhisper,
+  });
+  const effectiveMainTranscriberModel = cpuDefaults.mainTranscriberModel;
+  const effectiveInstallNemo = cpuDefaults.installNemo;
+  const effectiveInstallWhisper = cpuDefaults.installWhisper;
 
   // Pass HuggingFace token to the container for diarization model access
   if (hfToken !== undefined) {
@@ -1422,15 +2305,15 @@ async function startContainer(options: StartContainerOptions): Promise<string> {
     envUpdates['HUGGINGFACE_TOKEN_DECISION'] = normalizedHfDecision;
   }
 
-  if (installWhisper !== undefined) {
-    const whisperValue = installWhisper ? 'true' : 'false';
+  if (effectiveInstallWhisper !== undefined) {
+    const whisperValue = effectiveInstallWhisper ? 'true' : 'false';
     composeEnv['INSTALL_WHISPER'] = whisperValue;
     envUpdates['INSTALL_WHISPER'] = whisperValue;
   }
 
   // Pass NeMo install preference to the container for Parakeet ASR support
-  if (installNemo !== undefined) {
-    const nemoValue = installNemo ? 'true' : 'false';
+  if (effectiveInstallNemo !== undefined) {
+    const nemoValue = effectiveInstallNemo ? 'true' : 'false';
     composeEnv['INSTALL_NEMO'] = nemoValue;
     envUpdates['INSTALL_NEMO'] = nemoValue;
   }
@@ -1443,9 +2326,9 @@ async function startContainer(options: StartContainerOptions): Promise<string> {
   }
 
   // Pass ASR model selections to the container (empty string = use config.yaml default)
-  if (mainTranscriberModel !== undefined) {
-    composeEnv['MAIN_TRANSCRIBER_MODEL'] = mainTranscriberModel;
-    envUpdates['MAIN_TRANSCRIBER_MODEL'] = mainTranscriberModel;
+  if (effectiveMainTranscriberModel !== undefined) {
+    composeEnv['MAIN_TRANSCRIBER_MODEL'] = effectiveMainTranscriberModel;
+    envUpdates['MAIN_TRANSCRIBER_MODEL'] = effectiveMainTranscriberModel;
   }
   if (liveTranscriberModel !== undefined) {
     composeEnv['LIVE_TRANSCRIBER_MODEL'] = liveTranscriberModel;
@@ -1456,11 +2339,18 @@ async function startContainer(options: StartContainerOptions): Promise<string> {
     envUpdates['DIARIZATION_MODEL'] = diarizationModel;
   }
 
-  // Vulkan sidecar: set whisper-server URL based on networking mode and
-  // optionally pass a custom GGML model path.
-  if (runtimeProfile === 'vulkan') {
-    const serverUrl =
-      process.platform === 'linux' ? 'http://localhost:8080' : 'http://whisper-server:8080';
+  // Vulkan profiles: set whisper-server URL and optional GGML model path.
+  // vulkan (Linux): host-network mode → localhost; bridge elsewhere → Docker DNS.
+  // vulkan-wsl2 (Windows): whisper-server.exe runs natively on the Windows host,
+  //   reachable from inside Docker Desktop bridge via host.docker.internal.
+  if (runtimeProfile === 'vulkan' || runtimeProfile === 'vulkan-wsl2') {
+    let serverUrl: string;
+    if (runtimeProfile === 'vulkan-wsl2') {
+      serverUrl = 'http://host.docker.internal:8080';
+    } else {
+      serverUrl =
+        process.platform === 'linux' ? 'http://localhost:8080' : 'http://whisper-server:8080';
+    }
     composeEnv['WHISPERCPP_SERVER_URL'] = serverUrl;
     envUpdates['WHISPERCPP_SERVER_URL'] = serverUrl;
 
@@ -1474,6 +2364,9 @@ async function startContainer(options: StartContainerOptions): Promise<string> {
     envUpdates['WHISPERCPP_SERVER_URL'] = '';
     envUpdates['WHISPERCPP_MODEL'] = '';
   }
+  // Always clear MESA_D3D12_DEFAULT_ADAPTER_NAME — it was only used by the
+  // now-retired containerised whisper-server sidecar (docker-compose.vulkan-wsl2.yml).
+  envUpdates['MESA_D3D12_DEFAULT_ADAPTER_NAME'] = '';
 
   upsertComposeEnvValues(envUpdates);
 
@@ -1498,6 +2391,25 @@ async function startContainer(options: StartContainerOptions): Promise<string> {
 
   // Rotate the persistent server log — adds a session marker and trims old sessions.
   rotateServerLog();
+
+  // vulkan-wsl2: launch native whisper-server.exe before docker compose so the
+  // backend can reach it at host.docker.internal:8080 as soon as it starts.
+  if (runtimeProfile === 'vulkan-wsl2') {
+    const portFree = await isPort8080Free();
+    if (!portFree) {
+      throw new Error(
+        'Port 8080 is already in use by another process. ' + 'Free port 8080 and try again.',
+      );
+    }
+    await killExistingWhisperServer();
+    const ggmlFilename = (whispercppModel ?? 'ggml-large-v3-turbo.bin').replace(/^\/models\//, '');
+    const hostModelPath = path.join(getWhisperModelsDir(), ggmlFilename);
+    if (!fs.existsSync(hostModelPath)) {
+      console.log(`[DockerManager] Model not found at ${hostModelPath} — downloading...`);
+      await downloadGgmlModelToHost(ggmlFilename);
+    }
+    await launchWhisperServerNative(hostModelPath);
+  }
 
   const fileArgs = composeFileArgs(
     runtimeProfile,
@@ -1528,6 +2440,10 @@ async function startContainer(options: StartContainerOptions): Promise<string> {
  * Stop the container via docker compose.
  */
 async function stopContainer(): Promise<string> {
+  // Best-effort: clean up native whisper-server.exe if it was started by us.
+  await killExistingWhisperServer().catch((err) => {
+    console.warn('[DockerManager] killExistingWhisperServer on stop failed:', err?.message ?? err);
+  });
   try {
     return await exec(await runtimeBin(), ['compose', 'stop'], { cwd: getComposeDir() });
   } catch (composeErr: any) {
@@ -2248,9 +3164,18 @@ function unsubscribeFromDownloadEvents(callback: (event: BootstrapDownloadEvent)
 
 /**
  * Check for NVIDIA GPU + container toolkit availability.
- * Returns { gpu: boolean, toolkit: boolean }.
+ * Also probes Docker Desktop on Windows for WSL2 GPU paravirtualization
+ * (GH-101 follow-up) — surfaced via the optional `wslSupport` field, which is
+ * `undefined` on non-Win32 platforms.
+ *
+ * Returns { gpu, toolkit, vulkan, wslSupport? }.
  */
-async function checkGpu(): Promise<{ gpu: boolean; toolkit: boolean; vulkan: boolean }> {
+async function checkGpu(): Promise<{
+  gpu: boolean;
+  toolkit: boolean;
+  vulkan: boolean;
+  wslSupport?: WslSupport;
+}> {
   let gpu = false;
   let toolkit = false;
   let vulkan = false;
@@ -2321,7 +3246,295 @@ async function checkGpu(): Promise<{ gpu: boolean; toolkit: boolean; vulkan: boo
     }
   }
 
-  return { gpu, toolkit, vulkan };
+  // Win32: surface the `vulkan-wsl2` profile unconditionally.
+  //
+  // Historical note: this used to run a `docker run alpine:3 --device /dev/dxg`
+  // probe (via `detectWslGpuPassthrough`) to test whether a Linux container
+  // could see the GPU through WSL2 paravirtualization. That probe was written
+  // for the dzn-era meaning of `vulkan-wsl2` (Mesa-on-D3D12 inside a sidecar).
+  // The 2026-05-14 brainstorm pivoted the profile's implementation to launch
+  // native `whisper-server.exe` on the Windows host (see `launchWhisperServerNative`)
+  // and reach it from the backend via `host.docker.internal:8080`. That path
+  // does NOT consume /dev/dxg or the WSL UMD bundle, so the probe was testing
+  // preconditions the actual code path no longer needs — yet still blocked the
+  // UI option behind a manual `docker pull alpine:3` step.
+  //
+  // For now we just expose the profile to every Windows user and let the
+  // native preflight at `dockerManager.ts` line ~2080 catch the real failure
+  // modes (missing `whisper-server.exe`, port 8080 in use, etc.). A future
+  // pass can replace this with a Vulkan-ICD registry check if needed.
+  let wslSupport: WslSupport | undefined;
+  if (process.platform === 'win32') {
+    wslSupport = {
+      available: true,
+      gpuPassthroughDetected: true,
+      reason:
+        'vulkan-wsl2 profile is unconditionally available on Windows (native whisper-server.exe path)',
+    };
+    console.log(
+      '[DockerManager] Win32: vulkan-wsl2 profile offered unconditionally (probe retired)',
+    );
+  }
+
+  return { gpu, toolkit, vulkan, wslSupport };
+}
+
+/**
+ * Clear all GPU-detection caches so the next `checkGpu()` re-probes from
+ * scratch. Used by the "Re-detect GPU" affordance after a Docker Desktop
+ * WSL2 ↔ Hyper-V backend toggle (or any other change the dashboard can't
+ * observe directly). Cheap — just nulls module-level state.
+ */
+function resetGpuCache(): void {
+  resetWslSupportCache();
+  // Force `checkGpu()` to re-detect the toolkit mode (CDI vs legacy) too —
+  // a user who installs nvidia-container-toolkit mid-session benefits.
+  detectedGpuMode = null;
+}
+
+/**
+ * Check whether the Vulkan-WSL2 sidecar image (locally-built) is present.
+ * Used by the dashboard to decide whether to surface an actionable error
+ * pointing at `server/docker/build-vulkan-wsl2.sh` before container start.
+ *
+ * Short-circuits with `false` on any non-Win32 platform — the WSL2 image is
+ * Windows-only by design and inspecting it on Linux/macOS would just leak a
+ * Docker error message into logs.
+ */
+async function hasVulkanWsl2SidecarImage(): Promise<boolean> {
+  if (process.platform !== 'win32') {
+    return false;
+  }
+  try {
+    await exec(await runtimeBin(), ['image', 'inspect', VULKAN_WSL2_SIDECAR_IMAGE]);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// ─── Native whisper-server.exe (vulkan-wsl2) ────────────────────────────────
+
+function getWhisperServerExePath(): string {
+  return path.join(
+    app.getPath('appData'),
+    'TranscriptionSuite',
+    'whisper-server',
+    'whisper-server.exe',
+  );
+}
+
+function getWhisperServerPidPath(): string {
+  return path.join(app.getPath('appData'), 'TranscriptionSuite', 'whisper-server.pid');
+}
+
+function getWhisperModelsDir(): string {
+  return path.join(app.getPath('appData'), 'TranscriptionSuite', 'whisper-models');
+}
+
+/**
+ * Returns true if nothing is listening on localhost:8080.
+ */
+async function isPort8080Free(): Promise<boolean> {
+  return new Promise((resolve) => {
+    // Dynamic import keeps `net` out of the module-level scope.
+    import('net').then(({ createConnection }) => {
+      const socket = createConnection({ host: '127.0.0.1', port: 8080 });
+      socket.once('connect', () => {
+        socket.destroy();
+        resolve(false); // something is already listening
+      });
+      socket.once('error', () => {
+        resolve(true); // connection refused → port is free
+      });
+    });
+  });
+}
+
+/**
+ * Kill any whisper-server.exe process previously started by us (identified by
+ * the PID file).  No-op if the PID file does not exist or the process is
+ * already gone.
+ */
+async function killExistingWhisperServer(): Promise<void> {
+  const pidPath = getWhisperServerPidPath();
+  if (!fs.existsSync(pidPath)) return;
+
+  let pid: number;
+  try {
+    pid = parseInt(fs.readFileSync(pidPath, 'utf-8').trim(), 10);
+    if (isNaN(pid) || pid <= 0) return;
+  } catch {
+    return;
+  }
+
+  try {
+    // Signal 0 checks liveness without actually killing; on Windows this
+    // throws if the process does not exist.
+    process.kill(pid, 0);
+    process.kill(pid);
+    console.log(`[DockerManager] Killed whisper-server.exe (pid ${pid})`);
+  } catch {
+    // Process already gone — nothing to do.
+  } finally {
+    try {
+      fs.unlinkSync(pidPath);
+    } catch {
+      /* best-effort */
+    }
+  }
+}
+
+/**
+ * Check whether a GGML model file exists in the host-side whisper-models dir
+ * (used by the native whisper-server.exe on Windows; separate from the Docker volume).
+ */
+async function isGgmlModelDownloadedOnHost(fileName: string): Promise<boolean> {
+  const sanitized = path.basename(fileName.trim());
+  if (!isGgmlFileName(sanitized)) return false;
+  return fs.existsSync(path.join(getWhisperModelsDir(), sanitized));
+}
+
+/**
+ * Download a GGML model file directly to the host-side whisper-models directory
+ * (used by native whisper-server.exe on Windows; does not touch the Docker volume).
+ * Uses electron.net so redirects, proxies, and TLS are handled automatically.
+ */
+async function downloadGgmlModelToHost(fileName: string): Promise<void> {
+  const sanitized = path.basename(fileName.trim());
+  if (!isGgmlFileName(sanitized)) {
+    throw new Error(`Invalid GGML file name: ${fileName}`);
+  }
+
+  const modelsDir = getWhisperModelsDir();
+  fs.mkdirSync(modelsDir, { recursive: true });
+
+  const dest = path.join(modelsDir, sanitized);
+  const tmp = `${dest}.tmp`;
+  const url = `https://huggingface.co/ggerganov/whisper.cpp/resolve/main/${sanitized}`;
+
+  const { net } = await import('electron');
+
+  await new Promise<void>((resolve, reject) => {
+    const request = net.request({ url, redirect: 'follow' });
+    const file = fs.createWriteStream(tmp);
+
+    request.on('response', (response) => {
+      if (response.statusCode >= 400) {
+        file.destroy();
+        reject(new Error(`HTTP ${response.statusCode} downloading ${sanitized}`));
+        return;
+      }
+      response.on('data', (chunk) => file.write(chunk));
+      response.on('end', () => file.close(() => resolve()));
+      response.on('error', (err) => {
+        file.destroy();
+        reject(err);
+      });
+    });
+
+    request.on('error', (err) => {
+      file.destroy();
+      reject(err);
+    });
+    request.end();
+  }).catch((err) => {
+    try {
+      fs.unlinkSync(tmp);
+    } catch {
+      /* best-effort */
+    }
+    throw err;
+  });
+
+  fs.renameSync(tmp, dest);
+}
+
+/**
+ * Spawn whisper-server.exe as a detached background process and persist its
+ * PID so it can be killed on the next start or on clean app exit.
+ */
+async function launchWhisperServerNative(modelPath: string): Promise<void> {
+  const exePath = getWhisperServerExePath();
+  const child = spawn(exePath, ['--model', modelPath, '--host', '0.0.0.0', '--port', '8080'], {
+    detached: true,
+    stdio: 'ignore',
+  });
+  child.unref();
+
+  const pid = child.pid;
+  if (!pid) {
+    throw new Error('whisper-server.exe failed to start (no PID assigned).');
+  }
+
+  fs.mkdirSync(path.dirname(getWhisperServerPidPath()), { recursive: true });
+  fs.writeFileSync(getWhisperServerPidPath(), String(pid), { encoding: 'utf-8', mode: 0o600 });
+  console.log(`[DockerManager] Launched whisper-server.exe (pid ${pid}) with model: ${modelPath}`);
+}
+
+/**
+ * Create the whisper-server and whisper-models directories under AppData if
+ * they don't already exist. Called at app startup on Windows so the folders
+ * are present before the user ever selects the Vulkan WSL2 profile.
+ */
+function ensureWhisperDirectories(): void {
+  fs.mkdirSync(path.dirname(getWhisperServerExePath()), { recursive: true });
+  fs.mkdirSync(getWhisperModelsDir(), { recursive: true });
+}
+
+/**
+ * Download whisper-server.exe from GitHub LFS into the whisper-server AppData
+ * directory. The binary is stored in the repo under
+ * `server/whisper-server/whisper-server.exe` via Git LFS; GitHub raw URLs
+ * automatically redirect to the LFS object for public repos.
+ *
+ * Downloads to a `.tmp` sidecar first and renames on success so a partial
+ * download never leaves a corrupt executable behind.
+ */
+async function downloadWhisperServerExe(): Promise<void> {
+  const exePath = getWhisperServerExePath();
+  const tmp = `${exePath}.tmp`;
+  // TODO: change ref to `v${app.getVersion()}` once whisper-server.exe is
+  // committed at each release tag (currently lives on fix-vulcan-on-windows).
+  const url = `https://media.githubusercontent.com/media/homelab-00/TranscriptionSuite/feat/vulkan-on-windows/whisper-server/whisper-server.exe`;
+  fs.mkdirSync(path.dirname(exePath), { recursive: true });
+
+  const { net } = await import('electron');
+
+  await new Promise<void>((resolve, reject) => {
+    const request = net.request({ url, redirect: 'follow' });
+    const file = fs.createWriteStream(tmp);
+
+    request.on('response', (response) => {
+      if (response.statusCode >= 400) {
+        file.destroy();
+        reject(new Error(`HTTP ${response.statusCode} downloading whisper-server.exe from ${url}`));
+        return;
+      }
+      response.on('data', (chunk) => file.write(chunk));
+      response.on('end', () => file.close(() => resolve()));
+      response.on('error', (err) => {
+        file.destroy();
+        reject(err);
+      });
+    });
+
+    request.on('error', (err) => {
+      file.destroy();
+      reject(err);
+    });
+    request.end();
+  }).catch((err) => {
+    try {
+      fs.unlinkSync(tmp);
+    } catch {
+      /* best-effort */
+    }
+    throw err;
+  });
+
+  fs.renameSync(tmp, exePath);
+  console.log(`[DockerManager] whisper-server.exe downloaded to ${exePath}`);
 }
 
 // ─── Model Cache Inspection ─────────────────────────────────────────────────
@@ -2353,6 +3566,18 @@ async function checkModelsCached(modelIds: string[]): Promise<Record<string, Mod
   // Split into GGML flat-file models and HuggingFace hub models
   const ggmlIds = modelIds.filter((id) => isGgmlFileName(id));
   const hubIds = modelIds.filter((id) => !isGgmlFileName(id));
+
+  // On vulkan-wsl2 the GGML models are consumed by the native whisper-server.exe
+  // and live on the Windows host (%APPDATA%\TranscriptionSuite\whisper-models),
+  // NOT in the Docker volume. Check the host dir there. The Linux `vulkan` path
+  // still keeps GGML files in the container `/models/` volume.
+  if (readRuntimeProfileFromStore() === 'vulkan-wsl2') {
+    for (const id of ggmlIds) {
+      const exists = await isGgmlModelDownloadedOnHost(id).catch(() => false);
+      result[id] = { exists };
+    }
+    ggmlIds.length = 0;
+  }
 
   // Check GGML models: flat files at /models/{fileName}
   for (const id of ggmlIds) {
@@ -2567,8 +3792,8 @@ async function downloadModelToCache(modelId: string): Promise<void> {
  * Thin wrapper over `buildGhcrUrlsForRepo` declared at the top of this module
  * alongside the repo constants.
  */
-function buildGhcrUrls(useLegacyGpu: boolean): GhcrUrls {
-  return buildGhcrUrlsForRepo(resolveImageRepo(useLegacyGpu));
+function buildGhcrUrls(useLegacyGpu: boolean, runtimeProfile?: RuntimeProfile | null): GhcrUrls {
+  return buildGhcrUrlsForRepo(resolveImageRepo(useLegacyGpu, runtimeProfile));
 }
 
 const TAG_RE = /^v\d+\.\d+\.\d+(rc\d*)?$/;
@@ -2665,14 +3890,34 @@ export type RemoteTagsResult =
 /**
  * Fetch the tag list only (fast, ~1-2s). Dates are fetched separately
  * via fetchRemoteTagDates() so the UI isn't blocked.
+ *
+ * GH-99: the token endpoint returns 401 when the target GHCR package is
+ * Private (GHCR's first-push default). For the legacy variant — which has a
+ * history of being unpublished or newly pushed — we map that 401 to
+ * `not-published` so the dashboard surfaces the same actionable banner as a
+ * genuine "no tags yet" 404. The default repo is long-public, so a 401 there
+ * is a real registry fault and stays mapped to `error`.
+ *
+ * Exported for unit testing alongside `buildGhcrUrlsForRepo`.
  */
-async function listRemoteTags(): Promise<RemoteTagsResult> {
-  const { tokenUrl, tagsUrl } = buildGhcrUrls(readUseLegacyGpuFromStore());
+export async function listRemoteTags(): Promise<RemoteTagsResult> {
+  const useLegacyGpu = readUseLegacyGpuFromStore();
+  const runtimeProfile = readRuntimeProfileFromStore();
+  const { tokenUrl, tagsUrl } = buildGhcrUrls(useLegacyGpu, runtimeProfile);
   try {
     const signal = AbortSignal.timeout(5000);
 
     const tokenResp = await fetch(tokenUrl, { signal });
-    if (!tokenResp.ok) return { status: 'error', tags: [] };
+    if (!tokenResp.ok) {
+      // GH-99: legacy repo + 401 at the token step = Private package
+      // (the realistic failure mode post-v1.3.3). Route to the same UI
+      // affordance as a 404-on-tags-list so users see the actionable banner.
+      // Same treatment for vulkan-wsl2 — a new package starts private on GHCR.
+      if (tokenResp.status === 401 && (useLegacyGpu || runtimeProfile === 'vulkan-wsl2')) {
+        return { status: 'not-published', tags: [] };
+      }
+      return { status: 'error', tags: [] };
+    }
     const { token } = (await tokenResp.json()) as { token?: string };
     if (!token) return { status: 'error', tags: [] };
 
@@ -2704,7 +3949,10 @@ async function listRemoteTags(): Promise<RemoteTagsResult> {
  * Returns a map of tag → ISO date string.
  */
 async function fetchRemoteTagDates(tags: string[]): Promise<Record<string, string | null>> {
-  const { tokenUrl, blobBase } = buildGhcrUrls(readUseLegacyGpuFromStore());
+  const { tokenUrl, blobBase } = buildGhcrUrls(
+    readUseLegacyGpuFromStore(),
+    readRuntimeProfileFromStore(),
+  );
   const result: Record<string, string | null> = {};
   try {
     const signal = AbortSignal.timeout(8000);
@@ -2745,11 +3993,15 @@ export const dockerManager = {
   retryDetection,
   getRuntimeKind,
   checkGpu,
+  resetGpuCache,
+  runGpuPreflight,
+  runGpuDiagnostic,
   listImages,
   pullImage,
   cancelPull,
   isPulling,
   hasSidecarImage,
+  hasVulkanWsl2SidecarImage,
   pullSidecarImage,
   cancelSidecarPull,
   isSidecarPulling,
@@ -2773,6 +4025,10 @@ export const dockerManager = {
   removeModelCache,
   downloadModelToCache,
   isGgmlModelDownloaded,
+  isGgmlModelDownloadedOnHost,
+  downloadGgmlModelToHost,
+  ensureWhisperDirectories,
+  downloadWhisperServerExe,
   checkTailscaleCertsExist,
   subscribeToDownloadEvents,
   unsubscribeFromDownloadEvents,

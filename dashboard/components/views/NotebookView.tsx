@@ -51,9 +51,32 @@ import { useNotebookWatcher } from '../../src/hooks/useNotebookWatcher';
 import { apiClient } from '../../src/api/client';
 import type { AdminStatus, Recording } from '../../src/api/types';
 import { supportsExplicitWordTimestampToggle as supportsExplicitWordTimestampToggleForModel } from '../../src/utils/transcriptionBackend';
+import {
+  isCanaryModel,
+  supportsAutoDetect,
+  supportsTranslation,
+} from '../../src/services/modelCapabilities';
 import { toast } from 'sonner';
 import { useConfirm } from '../../src/hooks/useConfirm';
+import { DeleteRecordingDialog } from '../recording/DeleteRecordingDialog';
+import { useActiveProfileStore } from '../../src/stores/activeProfileStore';
 import { getConfig, setConfig } from '../../src/config/store';
+
+// GH #92: same allow-list as AddNoteModal's <input accept="…"> below — keep
+// the two in sync so per-hour drag-drop and the modal's browse/drop accept
+// the same formats.
+const AUDIO_EXTENSIONS = ['.mp3', '.wav', '.m4a', '.flac', '.ogg', '.webm', '.opus'];
+
+const isAudioFile = (file: File): boolean => {
+  const lower = file.name.toLowerCase();
+  return AUDIO_EXTENSIONS.some((ext) => lower.endsWith(ext));
+};
+
+const filterAudioFiles = (files: FileList | File[]): { audio: File[]; rejectedCount: number } => {
+  const list = Array.from(files);
+  const audio = list.filter(isAudioFile);
+  return { audio, rejectedCount: list.length - audio.length };
+};
 
 interface NotebookViewProps {
   activeTab: NotebookTab;
@@ -72,6 +95,9 @@ export const NotebookView: React.FC<NotebookViewProps> = ({ activeTab }) => {
   const [isAddModalOpen, setIsAddModalOpen] = useState(false);
   const [selectedTimeSlot, setSelectedTimeSlot] = useState<number | undefined>(undefined);
   const [selectedDateSlot, setSelectedDateSlot] = useState<string | undefined>(undefined);
+  // GH #92: files preloaded by drop-on-slot. Cleared when user opens the
+  // modal via the "+" button so the click flow stays empty.
+  const [selectedInitialFiles, setSelectedInitialFiles] = useState<File[] | undefined>(undefined);
 
   const handleNoteClick = (noteData: any) => {
     setSelectedNote(noteData);
@@ -81,8 +107,26 @@ export const NotebookView: React.FC<NotebookViewProps> = ({ activeTab }) => {
   const handleAddNote = (time: number, dateKey: string) => {
     setSelectedTimeSlot(time);
     setSelectedDateSlot(dateKey);
+    setSelectedInitialFiles(undefined);
     setIsAddModalOpen(true);
   };
+
+  // GH #92: invoked when audio files are dropped directly on a time slot.
+  // Filters non-audio at the call site (TimeSection) so we only ever receive
+  // a non-empty File[] here.
+  const handleDropFilesAtSlot = useCallback((time: number, dateKey: string, files: File[]) => {
+    setSelectedTimeSlot(time);
+    setSelectedDateSlot(dateKey);
+    setSelectedInitialFiles(files);
+    setIsAddModalOpen(true);
+  }, []);
+
+  // GH #92: clear initialFiles on close so the next "+" click (or stale
+  // reopen) never sees files from a previous drop session.
+  const handleAddModalClose = useCallback(() => {
+    setIsAddModalOpen(false);
+    setSelectedInitialFiles(undefined);
+  }, []);
 
   const bumpCalendarRefresh = useCallback(() => {
     setCalendarRefreshNonce((prev) => prev + 1);
@@ -122,6 +166,7 @@ export const NotebookView: React.FC<NotebookViewProps> = ({ activeTab }) => {
           <CalendarTab
             onNoteClick={handleNoteClick}
             onAddNote={handleAddNote}
+            onDropFilesAtSlot={handleDropFilesAtSlot}
             refreshNonce={calendarRefreshNonce}
           />
         );
@@ -150,9 +195,10 @@ export const NotebookView: React.FC<NotebookViewProps> = ({ activeTab }) => {
       {/* Add New Note Overlay */}
       <AddNoteModal
         isOpen={isAddModalOpen}
-        onClose={() => setIsAddModalOpen(false)}
+        onClose={handleAddModalClose}
         initialTime={selectedTimeSlot}
         initialDate={selectedDateSlot}
+        initialFiles={selectedInitialFiles}
         supportsExplicitWordTimestampToggle={supportsExplicitWordTimestampToggle}
       />
     </>
@@ -217,10 +263,13 @@ const NoteActionMenu: React.FC<MenuProps> = ({
   onRefresh,
   onPlay,
 }) => {
-  const { confirm, dialog: confirmDialog } = useConfirm();
+  const { dialog: confirmDialog } = useConfirm();
+  const activeProfileId = useActiveProfileStore((s) => s.activeProfileId);
   const [renaming, setRenaming] = useState(false);
   const [renameValue, setRenameValue] = useState(noteTitle);
   const [renameLoading, setRenameLoading] = useState(false);
+  // Issue #104, Story 3.7 — DeleteRecordingDialog state.
+  const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
   const renameInputRef = useRef<HTMLInputElement>(null);
   const getValidRecordingId = (): number | null =>
     typeof recordingId === 'number' && Number.isFinite(recordingId) ? recordingId : null;
@@ -275,24 +324,40 @@ const NoteActionMenu: React.FC<MenuProps> = ({
     onClose();
   };
 
-  const handleDelete = async () => {
+  const handleDelete = () => {
     const targetId = getValidRecordingId();
     if (targetId === null) {
       toast.error('Invalid recording ID.');
       onClose();
       return;
     }
-    if (
-      !(await confirm('Delete this recording? This cannot be undone.', {
-        danger: true,
-        confirmLabel: 'Delete',
-      }))
-    )
+    // Story 3.7 — open the deletion dialog with the on-disk-artifact
+    // checkbox; actual deletion fires from handleConfirmDelete.
+    setDeleteDialogOpen(true);
+  };
+
+  const handleConfirmDelete = async (deleteArtifacts: boolean) => {
+    setDeleteDialogOpen(false);
+    const targetId = getValidRecordingId();
+    if (targetId === null) {
+      onClose();
       return;
+    }
     try {
-      await apiClient.deleteRecording(targetId);
+      const result = await apiClient.deleteRecording(targetId, {
+        deleteArtifacts,
+        artifactProfileId: deleteArtifacts ? activeProfileId : null,
+      });
       await Promise.resolve(onRefresh());
-      toast.success('Recording deleted.');
+      // Surface any artifact-deletion failures so the user knows the DB
+      // delete succeeded but a file unlink didn't (R-EL32 best-effort).
+      if (result.artifact_failures?.length) {
+        toast.error(
+          `Recording deleted, but ${result.artifact_failures.length} on-disk file(s) could not be removed.`,
+        );
+      } else {
+        toast.success('Recording deleted.');
+      }
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Failed to delete recording.';
       toast.error(message);
@@ -349,6 +414,15 @@ const NoteActionMenu: React.FC<MenuProps> = ({
   return (
     <>
       {confirmDialog && createPortal(confirmDialog, document.body)}
+      <DeleteRecordingDialog
+        open={deleteDialogOpen}
+        recordingName={noteTitle}
+        onCancel={() => {
+          setDeleteDialogOpen(false);
+          onClose();
+        }}
+        onConfirm={handleConfirmDelete}
+      />
       {createPortal(
         <div
           className="fixed inset-0 z-50"
@@ -609,6 +683,9 @@ const TimeSection: React.FC<{
   onZoomChange: (slots: number) => void;
   onNoteClick: (note: EventData) => void;
   onAddNote: (hour: number) => void;
+  // GH #92: invoked when audio files are dropped on a specific hour row.
+  // Caller is responsible for filtering / toasting on non-audio drops.
+  onDropFilesAtSlot: (hour: number, files: FileList) => void;
   onRefresh: () => void;
 }> = ({
   title,
@@ -621,6 +698,7 @@ const TimeSection: React.FC<{
   onZoomChange,
   onNoteClick,
   onAddNote,
+  onDropFilesAtSlot,
   onRefresh,
 }) => {
   const hours = Array.from({ length: endHour - startHour }, (_, i) => startHour + i);
@@ -631,6 +709,11 @@ const TimeSection: React.FC<{
     trigger: MenuTrigger;
   } | null>(null);
   const isCompact = visibleSlots >= 4;
+  // GH #92: highlight the hour row currently under the user's drag cursor.
+  // dragOver fires repeatedly so setting on dragOver (mirroring the existing
+  // import-tab pattern at line ~1670) keeps the state accurate; clear on
+  // dragLeave or drop.
+  const [dragOverHour, setDragOverHour] = useState<number | null>(null);
 
   // Audio preview state
   const [previewingId, setPreviewingId] = useState<string | null>(null);
@@ -722,7 +805,7 @@ const TimeSection: React.FC<{
     });
   };
   return (
-    <div className="bg-glass-surface border-glass-border flex min-h-0 flex-1 flex-col overflow-hidden rounded-2xl border shadow-xl backdrop-blur-xl">
+    <div className="blur-panel bg-glass-surface border-glass-border flex min-h-0 flex-1 flex-col overflow-hidden rounded-2xl border shadow-xl backdrop-blur-xl">
       <div
         className={`z-10 flex h-14 shrink-0 items-center justify-between border-b border-white/5 px-5 backdrop-blur-md ${headerGradient}`}
       >
@@ -746,11 +829,46 @@ const TimeSection: React.FC<{
         <div className="h-full">
           {hours.map((hour) => {
             const hourEvents = events.filter((e) => Math.floor(e.startTime) === hour);
+            const isDropTarget = dragOverHour === hour;
             return (
               <div
                 key={hour}
-                className="group relative flex border-b border-white/5 transition-colors duration-300 last:border-0 hover:bg-white/2"
+                className={`group relative flex border-b transition-colors duration-300 last:border-0 ${
+                  isDropTarget
+                    ? 'border-accent-cyan/40 bg-accent-cyan/5'
+                    : 'border-white/5 hover:bg-white/2'
+                }`}
                 style={{ height: `${100 / visibleSlots}%` }}
+                onDragOver={(e) => {
+                  // GH #92: only react to OS file drags. Skipping internal
+                  // drags (text selections, image drags, intra-page drags)
+                  // avoids highlighting the row + hijacking events that the
+                  // user did not intend as a file drop.
+                  if (!Array.from(e.dataTransfer.types).includes('Files')) return;
+                  // Must preventDefault to enable a drop on this row (HTML5
+                  // DnD spec). Setting dropEffect='copy' shows the correct
+                  // cursor affordance on Windows / Chrome.
+                  e.preventDefault();
+                  e.dataTransfer.dropEffect = 'copy';
+                  if (dragOverHour !== hour) setDragOverHour(hour);
+                }}
+                onDragLeave={(e) => {
+                  // Only clear if we're truly leaving the row, not just
+                  // crossing into a child element. relatedTarget is the
+                  // element being entered; if it's still inside the row,
+                  // ignore the leave.
+                  const next = e.relatedTarget as Node | null;
+                  if (next && e.currentTarget.contains(next)) return;
+                  setDragOverHour((current) => (current === hour ? null : current));
+                }}
+                onDrop={(e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  setDragOverHour(null);
+                  if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+                    onDropFilesAtSlot(hour, e.dataTransfer.files);
+                  }
+                }}
               >
                 <div className="sticky left-0 z-20 w-16 shrink-0 pt-6 pr-4 text-right select-none">
                   <span className="font-mono text-xs font-medium text-slate-500">
@@ -898,8 +1016,12 @@ const recordingToEvent = (rec: Recording): EventData => {
 const CalendarTab: React.FC<{
   onNoteClick: (note: any) => void;
   onAddNote: (hour: number, dateKey: string) => void;
+  // GH #92: bridges per-hour drops up to NotebookView. Receives the raw
+  // FileList; this function filters to audio extensions and toasts on
+  // rejection before calling the parent.
+  onDropFilesAtSlot: (hour: number, dateKey: string, files: File[]) => void;
   refreshNonce: number;
-}> = ({ onNoteClick, onAddNote, refreshNonce }) => {
+}> = ({ onNoteClick, onAddNote, onDropFilesAtSlot, refreshNonce }) => {
   const [currentDate, setCurrentDate] = useState(() => new Date());
   const [selectedDay, setSelectedDay] = useState<string | null>(null);
   const [isHistoryOpen, setIsHistoryOpen] = useState(false);
@@ -1022,15 +1144,35 @@ const CalendarTab: React.FC<{
   const today = new Date();
   const todayKey = formatDateKey(today);
 
+  // GH #92: filter the raw FileList from a per-hour drop and forward to the
+  // parent. Toasts here so the wording is centralized for both Morning and
+  // Afternoon TimeSections.
+  const handleDropAtHour = useCallback(
+    (hour: number, files: FileList) => {
+      const { audio, rejectedCount } = filterAudioFiles(files);
+      if (audio.length === 0) {
+        toast.error('No audio files in drop', {
+          description: 'Supports MP3, WAV, M4A, FLAC, OGG, WebM, Opus.',
+        });
+        return;
+      }
+      if (rejectedCount > 0) {
+        toast.warning(`${rejectedCount} non-audio file${rejectedCount === 1 ? '' : 's'} ignored`);
+      }
+      onDropFilesAtSlot(hour, addNoteDateKey, audio);
+    },
+    [addNoteDateKey, onDropFilesAtSlot],
+  );
+
   return (
-    <div className="grid h-full min-h-0 grid-cols-1 gap-6 lg:grid-cols-3">
+    <div className="custom-scrollbar grid h-full min-h-0 grid-cols-1 gap-6 @max-[860px]:overflow-y-auto @min-[860px]:grid-cols-3">
       <style>{`
                 @keyframes slideInRight { from { transform: translateX(20px); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
                 @keyframes slideInLeft { from { transform: translateX(-20px); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
                 .anim-slide-right { animation: slideInRight 0.3s cubic-bezier(0.16, 1, 0.3, 1) forwards; }
                 .anim-slide-left { animation: slideInLeft 0.3s cubic-bezier(0.16, 1, 0.3, 1) forwards; }
             `}</style>
-      <div className="flex min-h-0 flex-col lg:col-span-2">
+      <div className="flex min-h-0 flex-col @max-[860px]:h-[70vh] @max-[860px]:min-h-[440px] @min-[860px]:col-span-2">
         <GlassCard
           className="flex h-full flex-col"
           title={calendarHeader}
@@ -1135,7 +1277,7 @@ const CalendarTab: React.FC<{
           </div>
         </GlassCard>
       </div>
-      <div className="flex h-full min-h-0 flex-col space-y-4 overflow-hidden">
+      <div className="flex h-full min-h-0 flex-col space-y-4 overflow-hidden @max-[860px]:h-[70vh] @max-[860px]:min-h-[440px] @max-[860px]:motion-safe:animate-[reflowStackIn_0.3s_cubic-bezier(0.16,1,0.3,1)]">
         <TimeSection
           title="Morning"
           headerColor="text-accent-orange"
@@ -1147,6 +1289,7 @@ const CalendarTab: React.FC<{
           onZoomChange={setVisibleSlots}
           onNoteClick={onNoteClick}
           onAddNote={(hour) => onAddNote(hour, addNoteDateKey)}
+          onDropFilesAtSlot={handleDropAtHour}
           onRefresh={calendar.refresh}
         />
         <TimeSection
@@ -1160,6 +1303,7 @@ const CalendarTab: React.FC<{
           onZoomChange={setVisibleSlots}
           onNoteClick={onNoteClick}
           onAddNote={(hour) => onAddNote(hour, addNoteDateKey)}
+          onDropFilesAtSlot={handleDropAtHour}
           onRefresh={calendar.refresh}
         />
       </div>
@@ -1323,6 +1467,14 @@ const ImportTab = ({
   const avgProcessingMs = useImportQueueStore((s) => s.avgProcessingMs);
   const watchLog = useImportQueueStore((s) => s.watchLog);
   const clearWatchLog = useImportQueueStore((s) => s.clearWatchLog);
+  const updateNotebookConfig = useImportQueueStore((s) => s.updateNotebookConfig);
+  const setLanguagesCache = useImportQueueStore((s) => s.setLanguagesCache);
+
+  // Issue #104, Sprint 4 deferred-work no. 2 — manual notebook uploads must
+  // forward the active profile id so the backend snapshots it onto the
+  // transcription job; without this the auto-summary / auto-export coordinator
+  // sees profile_snapshot=None and short-circuits as a no-op.
+  const activeProfileId = useActiveProfileStore((s) => s.activeProfileId);
 
   const {
     notebookWatchPath,
@@ -1400,11 +1552,65 @@ const ImportTab = ({
   const [parallelDefault, setParallelDefault] = useState<boolean>(false);
   const [isDragOver, setIsDragOver] = useState(false);
 
+  // gh-102 followup #2: notebook-upload surface honors the persisted Source
+  // Language and translation selection from SessionView. Mirrors the
+  // SessionImportTab load pattern (SessionImportTab.tsx:122–183 / 163–183) —
+  // the persisted picker is the single source of truth, no duplicate UI here.
+  const [mainLanguage, setMainLanguage] = useState<string>('Auto Detect');
+  const [mainTranslate, setMainTranslate] = useState<boolean>(false);
+  const [mainBidiTarget, setMainBidiTarget] = useState<string>('Off');
+
+  // Derive activeModel from the existing adminStatus prop (parent already
+  // computes the same thing; we re-derive locally to avoid prop-drilling
+  // the model name).
+  const activeModel: string | null =
+    adminStatus?.config?.main_transcriber?.model ??
+    adminStatus?.config?.transcription?.model ??
+    null;
+  const { languages, loading: languagesLoading } = useLanguages(activeModel);
+  const isCanaryMainBidi = isCanaryModel(activeModel) && mainLanguage === 'English';
+  const canTranslate = supportsTranslation(activeModel);
+
   useEffect(() => {
     if (!supportsExplicitWordTimestampToggle) {
       setWordTimestamps(true);
     }
   }, [supportsExplicitWordTimestampToggle]);
+
+  // gh-102 followup #2: hydrate the persisted Source Language picker selection
+  // (and Canary bidi state) from config. Mirrors SessionImportTab.tsx:163–183
+  // so all import surfaces converge on the same source-of-truth.
+  useEffect(() => {
+    let active = true;
+    void (async () => {
+      const [savedMainLanguage, savedMainTranslate, savedMainBidiTarget] = await Promise.all([
+        getConfig<string>('session.mainLanguage'),
+        getConfig<boolean>('session.mainTranslate'),
+        getConfig<string>('session.mainBidiTarget'),
+      ]);
+      if (!active) return;
+      if (typeof savedMainLanguage === 'string' && savedMainLanguage) {
+        setMainLanguage(savedMainLanguage);
+      }
+      if (typeof savedMainTranslate === 'boolean') setMainTranslate(savedMainTranslate);
+      if (typeof savedMainBidiTarget === 'string' && savedMainBidiTarget) {
+        setMainBidiTarget(savedMainBidiTarget);
+      }
+    })().catch(() => {});
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  // Resolve language code from display name. Mirrors SessionImportTab.tsx:270–277.
+  const resolveLanguage = useCallback(
+    (name: string): string | undefined => {
+      if (name === 'Auto Detect') return undefined;
+      const match = languages.find((l) => l.name === name);
+      return match?.code;
+    },
+    [languages],
+  );
 
   useEffect(() => {
     apiClient
@@ -1416,6 +1622,31 @@ const ImportTab = ({
       })
       .catch(() => {});
   }, []);
+
+  // Sync toggle state to the unified store so notebook-auto (Folder Watch)
+  // jobs honor these UI selections (Issue #93) and the source language picker
+  // (gh-102 #3). Manual notebook-normal jobs still pass options directly via
+  // handleFiles.
+  useEffect(() => {
+    updateNotebookConfig({
+      enableDiarization: diarization,
+      enableWordTimestamps: wordTimestamps,
+      parallelDiarization,
+      language: mainLanguage,
+    });
+  }, [diarization, wordTimestamps, parallelDiarization, mainLanguage, updateNotebookConfig]);
+
+  // gh-102 #3 — push useLanguages() results into the global languagesCache so
+  // handleFilesDetected (a non-React store action) can resolve display name →
+  // code. Mirror of the SessionImportTab effect; React Query dedupes the
+  // underlying fetch since both views use the same activeModel cache key.
+  useEffect(() => {
+    setLanguagesCache({
+      model: activeModel,
+      languages,
+      loading: languagesLoading,
+    });
+  }, [activeModel, languages, languagesLoading, setLanguagesCache]);
 
   // Constraint: diarization ON → force timestamps ON
   const handleDiarizationChange = useCallback((enabled: boolean) => {
@@ -1439,10 +1670,45 @@ const ImportTab = ({
   const handleFiles = useCallback(
     (files: FileList | null) => {
       if (!files || files.length === 0) return;
+
+      // gh-102 followup #2: mirror SessionImportTab.handleFiles guard
+      // (SessionImportTab.tsx:291–301). The Canary backend
+      // (canary_backend.py:79) raises ValueError when `language` is missing.
+      // Without this guard, dropping a file on Canary with an unresolvable
+      // picker round-trips to the backend fail-loud path. Wording matches the
+      // live-recording / session-import guard verbatim so future copy changes
+      // propagate via grep.
+      const resolvedLang = resolveLanguage(mainLanguage);
+      if (resolvedLang === undefined && !supportsAutoDetect(activeModel)) {
+        toast.error('Source language required', {
+          description: languagesLoading
+            ? 'Loading languages — please try again in a moment.'
+            : mainLanguage
+              ? `"${mainLanguage}" is not a valid source language for the active model. Pick a language from the Source Language dropdown.`
+              : 'No source language is selected. Pick a language from the Source Language dropdown.',
+        });
+        return;
+      }
+
+      // Translation parity: mirror SessionImportTab.tsx:308–313.
+      const mainTranslateActive = isCanaryMainBidi
+        ? mainBidiTarget !== 'Off'
+        : mainTranslate && canTranslate;
+      const mainTranslateTarget = isCanaryMainBidi
+        ? (resolveLanguage(mainBidiTarget) ?? 'en')
+        : 'en';
+
       addFiles(Array.from(files), 'notebook-normal', {
+        language: resolvedLang,
+        translation_enabled: mainTranslateActive ? true : undefined,
+        translation_target_language: mainTranslateActive ? mainTranslateTarget : undefined,
         enable_diarization: diarization,
         enable_word_timestamps: supportsExplicitWordTimestampToggle ? wordTimestamps : true,
         parallel_diarization: diarization ? parallelDiarization : undefined,
+        // Sprint 4 deferred-work no. 2 — pass undefined (not null) when no
+        // active profile is set so apiClient.uploadAndTranscribe's `!= null`
+        // guard correctly omits the FormData field.
+        profile_id: activeProfileId ?? undefined,
       });
 
       // 4.6 — track manual import count and possibly show hint
@@ -1457,12 +1723,21 @@ const ImportTab = ({
     },
     [
       addFiles,
+      activeProfileId,
       diarization,
       parallelDiarization,
       supportsExplicitWordTimestampToggle,
       wordTimestamps,
       notebookWatchPath,
       showWatchHint,
+      activeModel,
+      mainLanguage,
+      mainTranslate,
+      mainBidiTarget,
+      isCanaryMainBidi,
+      canTranslate,
+      languagesLoading,
+      resolveLanguage,
     ],
   );
 

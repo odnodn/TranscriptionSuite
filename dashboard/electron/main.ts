@@ -24,6 +24,7 @@ import Store from 'electron-store';
 import { CONTAINER_NAME, dockerManager, type StartContainerOptions } from './dockerManager.js';
 import { StartupEventWatcher } from './startupEventWatcher.js';
 import { MLXServerManager, type MLXStartOptions } from './mlxServerManager.js';
+import { createMlxLogSink, type MlxLogSink } from './mlxLogSink.js';
 import { TrayManager, type TrayState } from './trayManager.js';
 import { UpdateManager } from './updateManager.js';
 import { UpdateInstaller } from './updateInstaller.js';
@@ -108,11 +109,17 @@ const CLIENT_LOG_FILE = 'client-debug.log';
 const CLIENT_SESSION_MARKER = '══════ CLIENT START';
 const MAX_CLIENT_LOG_SESSIONS = 5;
 const MAX_CLIENT_LOG_LINES = 10_000;
+// MLX bare-metal logs are persisted alongside client-debug.log but in a
+// separate file so independent rotation budgets prevent a chatty MLX run
+// from evicting client-log history (and vice-versa).
+const MLX_LOG_FILE = 'mlx-server.log';
+const MLX_SESSION_MARKER = '══════ MLX SERVER START';
 const STOP_SERVER_ON_QUIT_TIMEOUT_MS = 30_000;
 const LEGACY_ELECTRON_DEBUG_LOG_FILE = path.resolve(__dirname, '../electron-debug.log');
 const MAIN_PROCESS_LOG_SOURCE = 'Electron';
 const MAIN_PROCESS_LOG_REMAINDER_MAX = 32_768;
 let clientLogFileSessionInitialized = false;
+let mlxLogFileSessionInitialized = false;
 let mainWindow: BrowserWindow | null = null;
 
 type ClientLogType = 'info' | 'success' | 'error' | 'warning';
@@ -187,6 +194,47 @@ function ensureClientLogFilePath(): string {
       console.warn('[Main] Failed to rotate client log:', err);
     }
     clientLogFileSessionInitialized = true;
+  }
+
+  return logFilePath;
+}
+
+function ensureMlxLogFilePath(): string {
+  const logDir = path.join(app.getPath('userData'), CLIENT_LOG_DIR);
+  fs.mkdirSync(logDir, { recursive: true });
+  const logFilePath = path.join(logDir, MLX_LOG_FILE);
+
+  if (!mlxLogFileSessionInitialized) {
+    try {
+      let existing = '';
+      try {
+        existing = fs.readFileSync(logFilePath, 'utf-8');
+      } catch {
+        // File doesn't exist yet — fine.
+      }
+
+      const marker = `${MLX_SESSION_MARKER} ${new Date().toISOString()} ══════\n`;
+      const combined = existing + marker;
+
+      // Reuse MAX_CLIENT_LOG_SESSIONS / MAX_CLIENT_LOG_LINES so rotation rules
+      // stay in sync with client-debug.log without redefining limits.
+      const parts = combined.split(MLX_SESSION_MARKER);
+      const sessionTrimmed =
+        parts.length > MAX_CLIENT_LOG_SESSIONS
+          ? MLX_SESSION_MARKER + parts.slice(-MAX_CLIENT_LOG_SESSIONS).join(MLX_SESSION_MARKER)
+          : combined;
+
+      const sessionLines = sessionTrimmed.split('\n');
+      const trimmed =
+        sessionLines.length > MAX_CLIENT_LOG_LINES
+          ? sessionLines.slice(-MAX_CLIENT_LOG_LINES).join('\n')
+          : sessionTrimmed;
+
+      fs.writeFileSync(logFilePath, trimmed, 'utf-8');
+    } catch (err) {
+      console.warn('[Main] Failed to rotate MLX log:', err);
+    }
+    mlxLogFileSessionInitialized = true;
   }
 
   return logFilePath;
@@ -429,6 +477,16 @@ const store = new Store({
     'app.modelSelectionOnboardingCompleted': false,
     'output.hideTimestamps': false,
     'ui.sidebarCollapsed': false,
+    // Issue #87 — user-facing escape valve for backdrop-blur CPU/GPU cost.
+    // Default true preserves the iOS-glass design; users can opt out per
+    // installation via Settings → App → Blur effects.
+    'ui.blurEffectsEnabled': true,
+    /* GH-87 — "Idle animations" toggle, independent of blur. When false,
+       freezes the idle visualizer waves to cut idle CPU/GPU. Default true (ON)
+       on every platform, so the animating design is preserved unless the user
+       opts out via Settings -> App -> Idle animations. Legacy
+       ui.lowIdleUsageEnabled values are migrated client-side at boot. */
+    'ui.idleAnimationsEnabled': true,
     'server.host': 'localhost',
     'server.port': 9786,
     'server.https': false,
@@ -457,6 +515,8 @@ const store = new Store({
     'app.starPopupShown': false,
     'folderWatch.sessionPath': '',
     'folderWatch.notebookPath': '',
+    'folderWatch.sessionWatchActive': false,
+    'folderWatch.notebookWatchActive': false,
   },
 });
 
@@ -474,7 +534,12 @@ const trayManager = new TrayManager(isDev, () => mainWindow);
 
 const watcherManager = new WatcherManager(() => mainWindow);
 
-const mlxServerManager = new MLXServerManager(() => mainWindow ?? null);
+const mlxLogSink: MlxLogSink = createMlxLogSink({
+  getWindow: () => mainWindow,
+  getLogFilePath: ensureMlxLogFilePath,
+});
+
+const mlxServerManager = new MLXServerManager(() => mainWindow ?? null, mlxLogSink);
 
 // ─── Update Manager ─────────────────────────────────────────────────────────
 
@@ -700,7 +765,10 @@ function createWindow(): void {
   mainWindow = new BrowserWindow({
     width: 1530,
     height: 860,
-    minWidth: 1262,
+    // Narrow-window reflow: floor = sidebar + left-panel min. Below this width the
+    // Session/Notebook side panels reflow below the main column via container queries
+    // (spec-reduce-min-window-width-panel-reflow). Was 1262 (sidebar + both panels).
+    minWidth: 720,
     minHeight: 600,
     show: !startMinimized,
     icon: iconPath,
@@ -777,6 +845,7 @@ function createWindow(): void {
   // Flush any log entries buffered before the renderer was ready.
   mainWindow.webContents.on('did-finish-load', () => {
     flushEarlyLogBuffer();
+    mlxLogSink.flush();
   });
 
   // M6 stable-launch confirmation is handled by the
@@ -1077,6 +1146,29 @@ ipcMain.handle('dialog:selectFolder', async () => {
   return result.filePaths[0];
 });
 
+// Issue #104, Story 3.5 — native file-save dialog for Download buttons.
+ipcMain.handle(
+  'dialog:saveFile',
+  async (
+    _event,
+    opts: {
+      defaultPath?: string;
+      filters?: { name: string; extensions: string[] }[];
+    },
+  ) => {
+    const mainWindow = BrowserWindow.getAllWindows()[0];
+    const result = await dialog.showSaveDialog(mainWindow, {
+      defaultPath: opts?.defaultPath,
+      filters: opts?.filters ?? [
+        { name: 'Text', extensions: ['txt'] },
+        { name: 'All Files', extensions: ['*'] },
+      ],
+    });
+    if (result.canceled || !result.filePath) return null;
+    return result.filePath;
+  },
+);
+
 // ─── Docker Management IPC ──────────────────────────────────────────────────
 
 ipcMain.handle('docker:available', async () => {
@@ -1102,6 +1194,20 @@ ipcMain.handle('docker:getComposeAvailable', async () => {
 
 ipcMain.handle('docker:checkGpu', async () => {
   return dockerManager.checkGpu();
+});
+
+ipcMain.handle('docker:resetGpuCache', async () => {
+  // Clears the wslDetect single-flight cache and detectedGpuMode so the next
+  // checkGpu() re-probes from scratch — used by the "Re-detect GPU" button.
+  dockerManager.resetGpuCache();
+});
+
+ipcMain.handle('docker:validateGpuPreflight', async () => {
+  return dockerManager.runGpuPreflight();
+});
+
+ipcMain.handle('docker:runGpuDiagnostic', async () => {
+  return dockerManager.runGpuDiagnostic();
 });
 
 ipcMain.handle('docker:listImages', async () => {
@@ -1130,6 +1236,10 @@ ipcMain.handle('docker:isPulling', () => {
 
 ipcMain.handle('docker:hasSidecarImage', async () => {
   return dockerManager.hasSidecarImage();
+});
+
+ipcMain.handle('docker:hasVulkanWsl2SidecarImage', async () => {
+  return dockerManager.hasVulkanWsl2SidecarImage();
 });
 
 ipcMain.handle('docker:pullSidecarImage', async () => {
@@ -1197,6 +1307,14 @@ ipcMain.handle('docker:removeModelCache', async (_event, modelId: string) => {
 
 ipcMain.handle('docker:downloadModelToCache', async (_event, modelId: string) => {
   return dockerManager.downloadModelToCache(modelId);
+});
+
+ipcMain.handle('docker:isGgmlModelDownloadedOnHost', async (_event, fileName: string) => {
+  return dockerManager.isGgmlModelDownloadedOnHost(fileName);
+});
+
+ipcMain.handle('docker:downloadGgmlModelToHost', async (_event, fileName: string) => {
+  return dockerManager.downloadGgmlModelToHost(fileName);
 });
 
 ipcMain.handle('docker:removeVolume', async (_event, name: string) => {
@@ -2162,6 +2280,10 @@ app.whenReady().then(async () => {
   trayManager.create();
   updateManager.start();
 
+  if (process.platform === 'win32') {
+    dockerManager.ensureWhisperDirectories();
+  }
+
   // ─── M6: launch watchdog ─────────────────────────────────────────────
   // Record a launch attempt for the running version and, if the counter
   // has crossed the restore threshold AND a different-version installer
@@ -2312,6 +2434,19 @@ ipcMain.handle('mlx:getStatus', () => {
 
 ipcMain.handle('mlx:getLogs', (_event, tail?: number) => {
   return mlxServerManager.getLogs(tail);
+});
+
+// Native model-cache ops for the Metal/MLX profile (no Docker container).
+ipcMain.handle('mlx:downloadModelToCache', async (_event, modelId: string) => {
+  await mlxServerManager.downloadModelToCache(modelId);
+});
+
+ipcMain.handle('mlx:checkModelsCached', async (_event, modelIds: string[]) => {
+  return mlxServerManager.checkModelsCached(modelIds);
+});
+
+ipcMain.handle('mlx:removeModelCache', async (_event, modelId: string) => {
+  await mlxServerManager.removeModelCache(modelId);
 });
 
 // ─── Watcher IPC Handlers ────────────────────────────────────────────────────

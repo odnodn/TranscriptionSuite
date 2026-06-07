@@ -1,5 +1,5 @@
 meta:
-  spec_version: 1.0.21
+  spec_version: 1.0.56
   contract_mode: closed_set
   source_scope: mockup_repo
   validation_method: static_source_scan
@@ -7,12 +7,51 @@ meta:
     repo_path: /home/Bill/Code_Projects/Python_Projects/TranscriptionSuite/dashboard
     source_files:
       - App.tsx
+      - components/__tests__/AddNoteModal.canary-language.test.tsx
+      - components/__tests__/AddNoteModal.initialFiles.test.tsx
+      - components/__tests__/AudioVisualizer.test.tsx
+      - components/__tests__/LogsView.test.tsx
+      - components/__tests__/NotebookView.canary-language.test.tsx
+      - components/__tests__/NotebookView.profile-id.test.tsx
       - components/__tests__/NotebookView.test.tsx
       - components/__tests__/ServerView.test.tsx
+      - components/__tests__/SessionImportTab.canary-language.test.tsx
+      - components/__tests__/SessionView.canary-language.test.tsx
       - components/__tests__/SessionView.test.tsx
+      - components/AriaLiveRegion.tsx
       - components/AudioVisualizer.tsx
+      - components/editor/FindReplaceTextEditor.test.tsx
+      - components/editor/FindReplaceTextEditor.tsx
+      - components/editor/FindReplaceToolbar.tsx
+      - components/import/__tests__/DedupChoiceContainer.test.tsx
+      - components/import/__tests__/DedupPromptModal.test.tsx
+      - components/import/DedupChoiceContainer.tsx
+      - components/import/DedupPromptModal.tsx
       - components/PopOutWindow.tsx
+      - components/profiles/__tests__/EmptyProfileForm.test.tsx
+      - components/profiles/__tests__/ModelProfileSelector.test.tsx
+      - components/profiles/__tests__/TemplatePreviewField.test.tsx
+      - components/profiles/EmptyProfileForm.tsx
+      - components/profiles/ModelProfileSelector.tsx
+      - components/profiles/ModelProfilesPanel.tsx
+      - components/profiles/ProfileSelector.tsx
+      - components/profiles/TemplatePreviewField.tsx
+      - components/recording/__tests__/AutoActionStatusBadge.test.tsx
+      - components/recording/__tests__/AutoActionStatusBadge.webhook.test.tsx
+      - components/recording/__tests__/ConfidenceChip.test.tsx
+      - components/recording/__tests__/DeleteRecordingDialog.test.tsx
+      - components/recording/__tests__/DiarizationReviewView.keyboard.test.tsx
+      - components/recording/__tests__/DownloadButtons.test.tsx
+      - components/recording/__tests__/SpeakerLabelRendering.test.tsx
+      - components/recording/__tests__/SpeakerRenameInput.test.tsx
+      - components/recording/AutoActionStatusBadge.tsx
+      - components/recording/ConfidenceChip.tsx
+      - components/recording/DeleteRecordingDialog.tsx
+      - components/recording/DiarizationReviewView.tsx
+      - components/recording/DownloadButtons.tsx
+      - components/recording/SpeakerRenameInput.tsx
       - components/Sidebar.tsx
+      - components/ui/__tests__/PersistentInfoBanner.test.tsx
       - components/ui/__tests__/UpdateBanner.test.tsx
       - components/ui/__tests__/UpdateModal.test.tsx
       - components/ui/ActivityNotifications.tsx
@@ -27,16 +66,23 @@ meta:
       - components/ui/icons/NvidiaIcon.tsx
       - components/ui/ImageTagChips.tsx
       - components/ui/LogTerminal.tsx
+      - components/ui/PersistentInfoBanner.tsx
       - components/ui/QueuePausedBanner.tsx
       - components/ui/ShortcutCapture.tsx
       - components/ui/StatusLight.tsx
       - components/ui/UpdateBanner.tsx
       - components/ui/UpdateModal.tsx
+      - components/views/__tests__/AudioNoteModal.auto-actions.test.tsx
+      - components/views/__tests__/GpuDiagnosticModal.test.tsx
+      - components/views/__tests__/GpuHealthCard.test.tsx
       - components/views/AboutModal.tsx
       - components/views/AddNoteModal.tsx
       - components/views/AudioNoteModal.tsx
       - components/views/BugReportModal.tsx
       - components/views/FullscreenVisualizer.tsx
+      - components/views/GpuDiagnosticModal.tsx
+      - components/views/GpuHealthCard.tsx
+      - components/views/LiveTranscriptView.tsx
       - components/views/LogsView.tsx
       - components/views/ModelManagerTab.tsx
       - components/views/ModelManagerView.tsx
@@ -51,7 +97,7 @@ meta:
       - index.tsx
       - src/index.css
       - types.ts
-    generated_at: 2026-04-21T06:30:02.289Z
+    generated_at: 2026-06-04T17:56:12.601Z
     notes: Canonicalized from live source scan for React+TypeScript+Tailwind mockup.
 foundation:
   color_space:
@@ -89,7 +135,11 @@ foundation:
         - "#000000"
         - "#0b1120"
         - "#0f172a"
+        - "#104"
+        - "#1091"
+        - "#1337"
         - "#14b8a6"
+        - "#1886"
         - "#1e293b"
         - "#1e3a5f"
         - "#22c55e"
@@ -142,11 +192,13 @@ foundation:
         - rgba(217, 70, 239, 0.5)
         - rgba(217,70,239,0.5)
         - rgba(22,31,50,0.9)
+        - rgba(22,31,50,0.95)
         - rgba(239,22,238,0.5)
         - rgba(239,68,68,0.35)
         - rgba(239,68,68,0.6)
         - rgba(244,63,94,0.15)
         - rgba(251, 146, 60, 0.3)
+        - rgba(251,146,60,0.3)
         - rgba(251,146,60,0.5)
         - rgba(255, 255, 255, 0.1)
         - rgba(255, 255, 255, 0.2)
@@ -199,6 +251,7 @@ foundation:
           shadow: shadow-blue-400/50
     blur_levels:
       backdrop:
+        - backdrop-blur
         - backdrop-blur-2xl
         - backdrop-blur-3xl
         - backdrop-blur-md
@@ -207,6 +260,7 @@ foundation:
         - backdrop-blur-xs
       filter:
         - blur-2xl
+        - blur-panel
     shadow_levels:
       classes:
         - shadow
@@ -244,14 +298,19 @@ foundation:
         - 700
       easings:
         - ease-[cubic-bezier(0.16, 1, 0.3, 1)]
+        - ease-[cubic-bezier(0.16,1,0.3,1)]
+        - ease-[cubic-bezier(0.22, 1, 0.36, 1)]
         - ease-[cubic-bezier(0.22,1,0.36,1)]
         - ease-[cubic-bezier(0.25,0.1,0.25,1)]
         - ease-[cubic-bezier(0.32,0.72,0,1)]
         - ease-[cubic-bezier(0.33,1,0.68,1)]
         - ease-in-out
-        - ease-out
       keyframes:
         - dropdown-appear
+        - idle-wave-cyan
+        - idle-wave-magenta
+        - idle-wave-orange
+        - reflowStackIn
         - slideInLeft
         - slideInRight
         - slideUpFromBottomEdge
@@ -271,6 +330,7 @@ foundation:
         - rounded-lg
         - rounded-md
         - rounded-r-full
+        - rounded-sm
         - rounded-t-2xl
         - rounded-tl-none
         - rounded-tr-none
@@ -281,6 +341,7 @@ foundation:
         - z-10
         - z-10000
         - z-20
+        - z-30
         - z-50
         - z-60
         - z-9999
@@ -289,9 +350,12 @@ foundation:
         - h-[85%]
         - h-[85vh]
         - max-h-[80vh]
-        - max-w-[55%]
+        - max-h-[90vh]
+        - min-h-[20rem]
         - min-h-[38px]
+        - min-h-[8rem]
         - min-h-[calc(100vh-30rem)]
+        - min-w-[2.5rem]
         - min-w-[5rem]
         - p-[3px]
         - shadow-[0_0_10px_#22d3ee]
@@ -406,6 +470,11 @@ utility_allowlist:
     - animate-in
     - animate-ping
     - animate-pulse
+    - aria-activedescendant
+    - aria-invalid
+    - aria-label
+    - aria-labels
+    - backdrop-blur
     - backdrop-blur-2xl
     - backdrop-blur-3xl
     - backdrop-blur-md
@@ -423,10 +492,13 @@ utility_allowlist:
     - bg-accent-orange
     - bg-accent-orange/10
     - bg-accent-rose/5
+    - bg-accent-violet/15
     - bg-amber-400/10
     - bg-amber-400/20
     - bg-amber-400/5
     - bg-amber-500/10
+    - bg-amber-500/15
+    - bg-amber-500/20
     - bg-amber-500/5
     - bg-black/10
     - bg-black/20
@@ -437,12 +509,15 @@ utility_allowlist:
     - bg-black/70
     - bg-black/75
     - bg-blue-400
-    - bg-blue-500
+    - bg-blue-400/10
+    - bg-blue-400/20
     - bg-blue-500/10
     - bg-cyan-400/10
     - bg-cyan-400/20
     - bg-cyan-400/70
+    - bg-cyan-500/80
     - bg-emerald-400/10
+    - bg-emerald-500/20
     - bg-glass-100
     - bg-glass-100/30
     - bg-glass-100/50
@@ -454,19 +529,20 @@ utility_allowlist:
     - bg-linear-to-br
     - bg-linear-to-r
     - bg-linear-to-t
-    - bg-orange-500
+    - bg-neutral-700
+    - bg-neutral-900
     - bg-orange-500/10
-    - bg-purple-500
     - bg-purple-500/10
     - bg-red-400/10
     - bg-red-500
     - bg-red-500/10
+    - bg-red-500/20
     - bg-red-500/25
     - bg-red-500/5
     - bg-slate-400/10
     - bg-slate-500
     - bg-slate-500/10
-    - bg-slate-600
+    - bg-slate-500/20
     - bg-slate-700
     - bg-slate-800
     - bg-slate-900
@@ -482,6 +558,7 @@ utility_allowlist:
     - bg-yellow-400/20
     - block
     - blur-2xl
+    - blur-panel
     - border
     - border-2
     - border-4
@@ -494,21 +571,24 @@ utility_allowlist:
     - border-accent-magenta/20
     - border-accent-magenta/5
     - border-accent-orange/20
-    - border-accent-orange/25
-    - border-accent-rose/20
     - border-amber-400/20
+    - border-amber-400/25
     - border-amber-400/30
     - border-amber-400/40
     - border-amber-500/20
     - border-amber-500/30
+    - border-amber-500/40
     - border-b
     - border-b-2
+    - border-blue-400/30
     - border-blue-500/20
     - border-cyan-400/30
     - border-dashed
+    - border-emerald-400/30
     - border-emerald-400/40
     - border-glass-100
     - border-glass-border
+    - border-green-500/20
     - border-green-500/30
     - border-l
     - border-l-2
@@ -527,6 +607,7 @@ utility_allowlist:
     - border-red-500/20
     - border-red-500/25
     - border-slate-400/30
+    - border-slate-500/40
     - border-slate-900
     - border-t
     - border-transparent
@@ -543,6 +624,7 @@ utility_allowlist:
     - bottom-right
     - cursor-not-allowed
     - cursor-pointer
+    - cursor-text
     - custom-scrollbar
     - delay-100
     - delay-150
@@ -554,7 +636,6 @@ utility_allowlist:
     - duration-500
     - duration-700
     - ease-in-out
-    - ease-out
     - fade-in
     - fill-mode-forwards
     - fixed
@@ -564,11 +645,13 @@ utility_allowlist:
     - flex-none
     - flex-nowrap
     - flex-row-reverse
+    - flex-shrink-0
     - flex-wrap
     - font-bold
     - font-light
     - font-medium
     - font-mono
+    - font-normal
     - font-sans
     - font-semibold
     - font-src
@@ -592,6 +675,8 @@ utility_allowlist:
     - gap-6
     - gap-8
     - gap-px
+    - gap-x-3
+    - gap-y-1
     - grid
     - grid-cols-1
     - grid-cols-2
@@ -635,15 +720,21 @@ utility_allowlist:
     - hover:bg-amber-400/30
     - hover:bg-amber-500/20
     - hover:bg-black/40
+    - hover:bg-blue-400/30
     - hover:bg-cyan-300
+    - hover:bg-cyan-400
     - hover:bg-cyan-400/30
+    - hover:bg-emerald-500/30
     - hover:bg-glass-100
     - hover:bg-glass-300
+    - hover:bg-neutral-600
     - hover:bg-red-500/10
     - hover:bg-red-500/20
+    - hover:bg-red-500/30
     - hover:bg-red-500/35
     - hover:bg-white/10
-    - hover:bg-white/2
+    - hover:bg-white/15
+    - hover:bg-white/20
     - hover:bg-white/5
     - hover:bg-white/8
     - hover:bg-yellow-400/30
@@ -656,8 +747,10 @@ utility_allowlist:
     - hover:shadow-lg
     - hover:text-accent-cyan
     - hover:text-accent-cyan/80
+    - hover:text-amber-100
     - hover:text-amber-300
     - hover:text-black
+    - hover:text-cyan-200
     - hover:text-cyan-300
     - hover:text-green-300
     - hover:text-red-300
@@ -684,23 +777,24 @@ utility_allowlist:
     - leading-relaxed
     - leading-snug
     - leading-tight
+    - leading-whitespace
     - left-0
     - left-3
     - left-4
     - left-8
-    - lg:col-span-2
     - lg:flex
     - lg:grid-cols-2
-    - lg:grid-cols-3
     - lg:p-10
-    - lg:p-8
     - line-clamp-2
+    - m-0
     - mask-gradient-right
     - max-h-32
     - max-h-40
     - max-h-48
     - max-h-60
     - max-h-72
+    - max-h-96
+    - max-height
     - max-w-20
     - max-w-2xl
     - max-w-3xl
@@ -716,6 +810,7 @@ utility_allowlist:
     - mb-1
     - mb-1.5
     - mb-2
+    - mb-2.5
     - mb-3
     - mb-4
     - mb-6
@@ -724,11 +819,10 @@ utility_allowlist:
     - md:grid-cols-2
     - md:grid-cols-4
     - md:items-center
-    - md:items-end
-    - md:justify-between
     - min-h-0
     - min-h-32
     - min-h-full
+    - min-height
     - min-w-0
     - min-w-100
     - min-w-25
@@ -756,8 +850,6 @@ utility_allowlist:
     - mt-6
     - mt-8
     - mt-auto
-    - mx-1
-    - mx-2
     - mx-auto
     - my-1
     - my-2
@@ -861,11 +953,11 @@ utility_allowlist:
     - rounded-lg
     - rounded-md
     - rounded-r-full
+    - rounded-sm
     - rounded-t-2xl
     - rounded-tl-none
     - rounded-tr-none
     - rounded-xl
-    - select-all
     - select-none
     - selectable-text
     - shadow
@@ -901,6 +993,7 @@ utility_allowlist:
     - space-y-2.5
     - space-y-3
     - space-y-4
+    - space-y-5
     - space-y-6
     - space-y-8
     - sticky
@@ -908,41 +1001,46 @@ utility_allowlist:
     - text-3xl
     - text-accent-cyan
     - text-accent-cyan/70
-    - text-accent-cyan/80
     - text-accent-magenta
     - text-accent-orange
-    - text-accent-rose
     - text-accent-violet
+    - text-accent-violet/80
     - text-amber-100
     - text-amber-200
     - text-amber-300
     - text-amber-300/60
-    - text-amber-300/80
+    - text-amber-300/70
     - text-amber-400
     - text-amber-400/60
     - text-amber-400/80
     - text-base
     - text-black
+    - text-blue-200
+    - text-blue-300
     - text-blue-400
     - text-center
     - text-cyan-100
     - text-cyan-200
+    - text-cyan-300
     - text-emerald-200
+    - text-emerald-300/70
     - text-emerald-400
     - text-green-400
-    - text-green-400/70
     - text-indigo-400
     - text-left
     - text-lg
+    - text-neutral-100
+    - text-orange-200
     - text-orange-400
     - text-orange-500
     - text-purple-400
     - text-red-100
-    - text-red-200/90
+    - text-red-200
     - text-red-300
     - text-red-400
     - text-red-400/80
     - text-right
+    - text-slate-100
     - text-slate-200
     - text-slate-300
     - text-slate-400
@@ -951,7 +1049,6 @@ utility_allowlist:
     - text-slate-700
     - text-slate-900
     - text-sm
-    - text-violet-400
     - text-white
     - text-white/60
     - text-white/90
@@ -983,6 +1080,7 @@ utility_allowlist:
     - transition-opacity
     - transition-shadow
     - transition-transform
+    - translate-to-English
     - translate-x-4
     - translate-x-5
     - truncate
@@ -1015,9 +1113,9 @@ utility_allowlist:
     - w-7
     - w-72
     - w-8
-    - w-80
     - w-9
     - w-full
+    - w-max
     - w-px
     - w-screen
     - whitespace-nowrap
@@ -1026,6 +1124,7 @@ utility_allowlist:
     - z-10
     - z-10000
     - z-20
+    - z-30
     - z-50
     - z-60
     - z-9999
@@ -1034,6 +1133,7 @@ utility_allowlist:
     - bg-[#0b1120]
     - bg-[#0f172a]
     - bg-[rgba(22,31,50,0.9)]
+    - bg-[rgba(22,31,50,0.95)]
     - ease-[cubic-bezier(0.22,1,0.36,1)]
     - ease-[cubic-bezier(0.25,0.1,0.25,1)]
     - ease-[cubic-bezier(0.32,0.72,0,1)]
@@ -1041,10 +1141,13 @@ utility_allowlist:
     - h-[85%]
     - h-[85vh]
     - max-h-[80vh]
-    - max-w-[55%]
+    - max-h-[90vh]
     - md:grid-cols-[minmax(0,1fr)_minmax(0,1.2fr)]
+    - min-h-[20rem]
     - min-h-[38px]
+    - min-h-[8rem]
     - min-h-[calc(100vh-30rem)]
+    - min-w-[2.5rem]
     - min-w-[5rem]
     - p-[3px]
     - shadow-[0_0_10px_#22d3ee]
@@ -1130,12 +1233,18 @@ inline_style_allowlist:
     - visible
   keyframes:
     - dropdown-appear
+    - idle-wave-cyan
+    - idle-wave-magenta
+    - idle-wave-orange
+    - reflowStackIn
     - slideInLeft
     - slideInRight
     - slideUpFromBottomEdge
   animation_strings: []
   cubic_beziers:
     - cubic-bezier(0.16, 1, 0.3, 1)
+    - cubic-bezier(0.16,1,0.3,1)
+    - cubic-bezier(0.22, 1, 0.36, 1)
     - cubic-bezier(0.22,1,0.36,1)
     - cubic-bezier(0.25,0.1,0.25,1)
     - cubic-bezier(0.32,0.72,0,1)
@@ -1147,8 +1256,8 @@ blur_depth_budgets:
       max: 8
       reason: Four mutually-exclusive confirmation dialogs (overlay + panel each); only one mounts at a time.
     components/views/AudioNoteModal.tsx:
-      max: 5
-      reason: Sibling visualizer overlays + modal chrome stack only when the modal is open.
+      max: 7
+      reason: Sibling visualizer overlays + modal chrome + GH
     components/views/BugReportModal.tsx:
       max: 4
       reason: Modal overlay + panel + nested input/preview surfaces.
@@ -1344,6 +1453,23 @@ component_contracts:
     state_rules:
       - id: focus-ring
         rule: Focusable switch keeps cyan ring and slate offset ring styling for keyboard visibility.
+  AriaLiveRegion:
+    file: components/AriaLiveRegion.tsx
+    required_tokens:
+      - colors
+      - motion
+      - radii
+      - shadows
+    allowed_variants: {}
+    structural_invariants:
+      - id: structure-stable
+        rule: Preserve current structural layout and region hierarchy for this component.
+    behavior_rules:
+      - id: motion-locked
+        rule: Use only approved motion tokens and classes from foundation token registry.
+    state_rules:
+      - id: closed-set-styles
+        rule: Do not introduce unregistered utility, arbitrary, or inline style values.
   AudioNoteModal:
     file: components/views/AudioNoteModal.tsx
     required_tokens:
@@ -1396,15 +1522,33 @@ component_contracts:
       mode:
         - embedded
         - fullscreen
+        - idle-svg
     structural_invariants:
       - id: canvas-layering
-        rule: Canvas visualizer keeps grid overlay, bordered surface, and rounded container hierarchy.
+        rule: Visualizer keeps grid overlay, bordered surface, and rounded container hierarchy regardless of inner element (canvas or idle SVG).
     behavior_rules:
       - id: raf-loop
-        rule: Visualizer animation must run via requestAnimationFrame and retain layered cyan/magenta/orange wave rendering.
+        rule: Active visualizer animation runs via requestAnimationFrame; idle visualizer animation runs via declarative CSS keyframes on SVG paths. Both paths retain the layered cyan/magenta/orange palette.
     state_rules:
       - id: responsive-resize
-        rule: Canvas dimensions must track parent element resize behavior before drawing frames.
+        rule: Visualizer dimensions track parent element resize — canvas via window resize listener, idle SVG via viewBox.
+  AutoActionStatusBadge:
+    file: components/recording/AutoActionStatusBadge.tsx
+    required_tokens:
+      - colors
+      - motion
+      - radii
+      - shadows
+    allowed_variants: {}
+    structural_invariants:
+      - id: structure-stable
+        rule: Preserve current structural layout and region hierarchy for this component.
+    behavior_rules:
+      - id: motion-locked
+        rule: Use only approved motion tokens and classes from foundation token registry.
+    state_rules:
+      - id: closed-set-styles
+        rule: Do not introduce unregistered utility, arbitrary, or inline style values.
   BugReportModal:
     file: components/views/BugReportModal.tsx
     required_tokens:
@@ -1514,6 +1658,40 @@ component_contracts:
     state_rules:
       - id: open-accent
         rule: Open state title accent remains magenta and chevron rotates with white highlighted background.
+  ConfidenceChip:
+    file: components/recording/ConfidenceChip.tsx
+    required_tokens:
+      - colors
+      - motion
+      - radii
+      - shadows
+    allowed_variants: {}
+    structural_invariants:
+      - id: structure-stable
+        rule: Preserve current structural layout and region hierarchy for this component.
+    behavior_rules:
+      - id: motion-locked
+        rule: Use only approved motion tokens and classes from foundation token registry.
+    state_rules:
+      - id: closed-set-styles
+        rule: Do not introduce unregistered utility, arbitrary, or inline style values.
+  CopyableCommand:
+    file: components/views/GpuHealthCard.tsx
+    required_tokens:
+      - colors
+      - motion
+      - radii
+      - shadows
+    allowed_variants: {}
+    structural_invariants:
+      - id: structure-stable
+        rule: Preserve current structural layout and region hierarchy for this component.
+    behavior_rules:
+      - id: motion-locked
+        rule: Use only approved motion tokens and classes from foundation token registry.
+    state_rules:
+      - id: closed-set-styles
+        rule: Do not introduce unregistered utility, arbitrary, or inline style values.
   CustomModelRow:
     file: components/views/ModelManagerTab.tsx
     required_tokens:
@@ -1555,6 +1733,108 @@ component_contracts:
     state_rules:
       - id: active-option-dot
         rule: Selected option indicator dot color/shadow must follow accentColor variant mapping.
+  DedupChoiceContainer:
+    file: components/import/DedupChoiceContainer.tsx
+    required_tokens:
+      - colors
+      - motion
+      - radii
+      - shadows
+    allowed_variants: {}
+    structural_invariants:
+      - id: structure-stable
+        rule: Preserve current structural layout and region hierarchy for this component.
+    behavior_rules:
+      - id: motion-locked
+        rule: Use only approved motion tokens and classes from foundation token registry.
+    state_rules:
+      - id: closed-set-styles
+        rule: Do not introduce unregistered utility, arbitrary, or inline style values.
+  DedupPromptModal:
+    file: components/import/DedupPromptModal.tsx
+    required_tokens:
+      - colors
+      - motion
+      - radii
+      - shadows
+    allowed_variants: {}
+    structural_invariants:
+      - id: structure-stable
+        rule: Preserve current structural layout and region hierarchy for this component.
+    behavior_rules:
+      - id: motion-locked
+        rule: Use only approved motion tokens and classes from foundation token registry.
+    state_rules:
+      - id: closed-set-styles
+        rule: Do not introduce unregistered utility, arbitrary, or inline style values.
+  DeleteRecordingDialog:
+    file: components/recording/DeleteRecordingDialog.tsx
+    required_tokens:
+      - colors
+      - motion
+      - radii
+      - shadows
+    allowed_variants: {}
+    structural_invariants:
+      - id: structure-stable
+        rule: Preserve current structural layout and region hierarchy for this component.
+    behavior_rules:
+      - id: motion-locked
+        rule: Use only approved motion tokens and classes from foundation token registry.
+    state_rules:
+      - id: closed-set-styles
+        rule: Do not introduce unregistered utility, arbitrary, or inline style values.
+  DiarizationReviewView:
+    file: components/recording/DiarizationReviewView.tsx
+    required_tokens:
+      - colors
+      - motion
+      - radii
+      - shadows
+    allowed_variants: {}
+    structural_invariants:
+      - id: structure-stable
+        rule: Preserve current structural layout and region hierarchy for this component.
+    behavior_rules:
+      - id: motion-locked
+        rule: Use only approved motion tokens and classes from foundation token registry.
+    state_rules:
+      - id: closed-set-styles
+        rule: Do not introduce unregistered utility, arbitrary, or inline style values.
+  DownloadButtons:
+    file: components/recording/DownloadButtons.tsx
+    required_tokens:
+      - colors
+      - motion
+      - radii
+      - shadows
+    allowed_variants: {}
+    structural_invariants:
+      - id: structure-stable
+        rule: Preserve current structural layout and region hierarchy for this component.
+    behavior_rules:
+      - id: motion-locked
+        rule: Use only approved motion tokens and classes from foundation token registry.
+    state_rules:
+      - id: closed-set-styles
+        rule: Do not introduce unregistered utility, arbitrary, or inline style values.
+  EmptyProfileForm:
+    file: components/profiles/EmptyProfileForm.tsx
+    required_tokens:
+      - colors
+      - motion
+      - radii
+      - shadows
+    allowed_variants: {}
+    structural_invariants:
+      - id: structure-stable
+        rule: Preserve current structural layout and region hierarchy for this component.
+    behavior_rules:
+      - id: motion-locked
+        rule: Use only approved motion tokens and classes from foundation token registry.
+    state_rules:
+      - id: closed-set-styles
+        rule: Do not introduce unregistered utility, arbitrary, or inline style values.
   ErrorFallback:
     file: components/ui/ErrorFallback.tsx
     required_tokens:
@@ -1574,6 +1854,40 @@ component_contracts:
         rule: Do not introduce unregistered utility, arbitrary, or inline style values.
   FieldRow:
     file: components/views/ServerConfigEditor.tsx
+    required_tokens:
+      - colors
+      - motion
+      - radii
+      - shadows
+    allowed_variants: {}
+    structural_invariants:
+      - id: structure-stable
+        rule: Preserve current structural layout and region hierarchy for this component.
+    behavior_rules:
+      - id: motion-locked
+        rule: Use only approved motion tokens and classes from foundation token registry.
+    state_rules:
+      - id: closed-set-styles
+        rule: Do not introduce unregistered utility, arbitrary, or inline style values.
+  FindReplaceTextEditor:
+    file: components/editor/FindReplaceTextEditor.tsx
+    required_tokens:
+      - colors
+      - motion
+      - radii
+      - shadows
+    allowed_variants: {}
+    structural_invariants:
+      - id: structure-stable
+        rule: Preserve current structural layout and region hierarchy for this component.
+    behavior_rules:
+      - id: motion-locked
+        rule: Use only approved motion tokens and classes from foundation token registry.
+    state_rules:
+      - id: closed-set-styles
+        rule: Do not introduce unregistered utility, arbitrary, or inline style values.
+  FindReplaceToolbar:
+    file: components/editor/FindReplaceToolbar.tsx
     required_tokens:
       - colors
       - motion
@@ -1635,6 +1949,57 @@ component_contracts:
     state_rules:
       - id: header-optional
         rule: Title/action header is optional but when present must retain h-14 bordered header pattern.
+  GpuDiagnosticModal:
+    file: components/views/GpuDiagnosticModal.tsx
+    required_tokens:
+      - colors
+      - motion
+      - radii
+      - shadows
+    allowed_variants: {}
+    structural_invariants:
+      - id: structure-stable
+        rule: Preserve current structural layout and region hierarchy for this component.
+    behavior_rules:
+      - id: motion-locked
+        rule: Use only approved motion tokens and classes from foundation token registry.
+    state_rules:
+      - id: closed-set-styles
+        rule: Do not introduce unregistered utility, arbitrary, or inline style values.
+  GpuHealthCard:
+    file: components/views/GpuHealthCard.tsx
+    required_tokens:
+      - colors
+      - motion
+      - radii
+      - shadows
+    allowed_variants: {}
+    structural_invariants:
+      - id: structure-stable
+        rule: Preserve current structural layout and region hierarchy for this component.
+    behavior_rules:
+      - id: motion-locked
+        rule: Use only approved motion tokens and classes from foundation token registry.
+    state_rules:
+      - id: closed-set-styles
+        rule: Do not introduce unregistered utility, arbitrary, or inline style values.
+  Harness:
+    file: components/editor/FindReplaceTextEditor.test.tsx
+    required_tokens:
+      - colors
+      - motion
+      - radii
+      - shadows
+    allowed_variants: {}
+    structural_invariants:
+      - id: structure-stable
+        rule: Preserve current structural layout and region hierarchy for this component.
+    behavior_rules:
+      - id: motion-locked
+        rule: Use only approved motion tokens and classes from foundation token registry.
+    state_rules:
+      - id: closed-set-styles
+        rule: Do not introduce unregistered utility, arbitrary, or inline style values.
   HistoryPicker:
     file: components/views/NotebookView.tsx
     required_tokens:
@@ -1737,6 +2102,40 @@ component_contracts:
     state_rules:
       - id: closed-set-styles
         rule: Do not introduce unregistered utility, arbitrary, or inline style values.
+  IssueRow:
+    file: components/views/GpuDiagnosticModal.tsx
+    required_tokens:
+      - colors
+      - motion
+      - radii
+      - shadows
+    allowed_variants: {}
+    structural_invariants:
+      - id: structure-stable
+        rule: Preserve current structural layout and region hierarchy for this component.
+    behavior_rules:
+      - id: motion-locked
+        rule: Use only approved motion tokens and classes from foundation token registry.
+    state_rules:
+      - id: closed-set-styles
+        rule: Do not introduce unregistered utility, arbitrary, or inline style values.
+  LiveTranscriptView:
+    file: components/views/LiveTranscriptView.tsx
+    required_tokens:
+      - colors
+      - motion
+      - radii
+      - shadows
+    allowed_variants: {}
+    structural_invariants:
+      - id: structure-stable
+        rule: Preserve current structural layout and region hierarchy for this component.
+    behavior_rules:
+      - id: motion-locked
+        rule: Use only approved motion tokens and classes from foundation token registry.
+    state_rules:
+      - id: closed-set-styles
+        rule: Do not introduce unregistered utility, arbitrary, or inline style values.
   LogsView:
     file: components/views/LogsView.tsx
     required_tokens:
@@ -1795,6 +2194,40 @@ component_contracts:
         rule: Do not introduce unregistered utility, arbitrary, or inline style values.
   ModelManagerView:
     file: components/views/ModelManagerView.tsx
+    required_tokens:
+      - colors
+      - motion
+      - radii
+      - shadows
+    allowed_variants: {}
+    structural_invariants:
+      - id: structure-stable
+        rule: Preserve current structural layout and region hierarchy for this component.
+    behavior_rules:
+      - id: motion-locked
+        rule: Use only approved motion tokens and classes from foundation token registry.
+    state_rules:
+      - id: closed-set-styles
+        rule: Do not introduce unregistered utility, arbitrary, or inline style values.
+  ModelProfileSelector:
+    file: components/profiles/ModelProfileSelector.tsx
+    required_tokens:
+      - colors
+      - motion
+      - radii
+      - shadows
+    allowed_variants: {}
+    structural_invariants:
+      - id: structure-stable
+        rule: Preserve current structural layout and region hierarchy for this component.
+    behavior_rules:
+      - id: motion-locked
+        rule: Use only approved motion tokens and classes from foundation token registry.
+    state_rules:
+      - id: closed-set-styles
+        rule: Do not introduce unregistered utility, arbitrary, or inline style values.
+  ModelProfilesPanel:
+    file: components/profiles/ModelProfilesPanel.tsx
     required_tokens:
       - colors
       - motion
@@ -1891,8 +2324,42 @@ component_contracts:
     state_rules:
       - id: closed-set-styles
         rule: Do not introduce unregistered utility, arbitrary, or inline style values.
+  PersistentInfoBanner:
+    file: components/ui/PersistentInfoBanner.tsx
+    required_tokens:
+      - colors
+      - motion
+      - radii
+      - shadows
+    allowed_variants: {}
+    structural_invariants:
+      - id: structure-stable
+        rule: Preserve current structural layout and region hierarchy for this component.
+    behavior_rules:
+      - id: motion-locked
+        rule: Use only approved motion tokens and classes from foundation token registry.
+    state_rules:
+      - id: closed-set-styles
+        rule: Do not introduce unregistered utility, arbitrary, or inline style values.
   PopOutWindow:
     file: components/PopOutWindow.tsx
+    required_tokens:
+      - colors
+      - motion
+      - radii
+      - shadows
+    allowed_variants: {}
+    structural_invariants:
+      - id: structure-stable
+        rule: Preserve current structural layout and region hierarchy for this component.
+    behavior_rules:
+      - id: motion-locked
+        rule: Use only approved motion tokens and classes from foundation token registry.
+    state_rules:
+      - id: closed-set-styles
+        rule: Do not introduce unregistered utility, arbitrary, or inline style values.
+  ProfileSelector:
+    file: components/profiles/ProfileSelector.tsx
     required_tokens:
       - colors
       - motion
@@ -2152,8 +2619,42 @@ component_contracts:
     state_rules:
       - id: status-dots
         rule: Session, notebook, and server nav items retain StatusLight indicators, with notebook status sharing the server status source.
+  SpeakerRenameInput:
+    file: components/recording/SpeakerRenameInput.tsx
+    required_tokens:
+      - colors
+      - motion
+      - radii
+      - shadows
+    allowed_variants: {}
+    structural_invariants:
+      - id: structure-stable
+        rule: Preserve current structural layout and region hierarchy for this component.
+    behavior_rules:
+      - id: motion-locked
+        rule: Use only approved motion tokens and classes from foundation token registry.
+    state_rules:
+      - id: closed-set-styles
+        rule: Do not introduce unregistered utility, arbitrary, or inline style values.
   StarPopupModal:
     file: components/views/StarPopupModal.tsx
+    required_tokens:
+      - colors
+      - motion
+      - radii
+      - shadows
+    allowed_variants: {}
+    structural_invariants:
+      - id: structure-stable
+        rule: Preserve current structural layout and region hierarchy for this component.
+    behavior_rules:
+      - id: motion-locked
+        rule: Use only approved motion tokens and classes from foundation token registry.
+    state_rules:
+      - id: closed-set-styles
+        rule: Do not introduce unregistered utility, arbitrary, or inline style values.
+  StateIcon:
+    file: components/views/GpuHealthCard.tsx
     required_tokens:
       - colors
       - motion
@@ -2212,6 +2713,23 @@ component_contracts:
     state_rules:
       - id: status-color-map
         rule: Each status maps to registered bg/shadow token pair and cannot drift from status palette.
+  TemplatePreviewField:
+    file: components/profiles/TemplatePreviewField.tsx
+    required_tokens:
+      - colors
+      - motion
+      - radii
+      - shadows
+    allowed_variants: {}
+    structural_invariants:
+      - id: structure-stable
+        rule: Preserve current structural layout and region hierarchy for this component.
+    behavior_rules:
+      - id: motion-locked
+        rule: Use only approved motion tokens and classes from foundation token registry.
+    state_rules:
+      - id: closed-set-styles
+        rule: Do not introduce unregistered utility, arbitrary, or inline style values.
   TimeSection:
     file: components/views/NotebookView.tsx
     required_tokens:
@@ -2236,6 +2754,23 @@ component_contracts:
     state_rules:
       - id: compact-density-mode
         rule: Compact mode behavior is governed by visibleSlots threshold and keeps AI/duration collapse behavior.
+  TranscriptStub:
+    file: components/recording/__tests__/SpeakerLabelRendering.test.tsx
+    required_tokens:
+      - colors
+      - motion
+      - radii
+      - shadows
+    allowed_variants: {}
+    structural_invariants:
+      - id: structure-stable
+        rule: Preserve current structural layout and region hierarchy for this component.
+    behavior_rules:
+      - id: motion-locked
+        rule: Use only approved motion tokens and classes from foundation token registry.
+    state_rules:
+      - id: closed-set-styles
+        rule: Do not introduce unregistered utility, arbitrary, or inline style values.
   UpdateBanner:
     file: components/ui/UpdateBanner.tsx
     required_tokens:

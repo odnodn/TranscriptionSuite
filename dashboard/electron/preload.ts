@@ -78,7 +78,13 @@ export type CompatResult =
   | { result: 'unknown'; reason: CompatUnknownReason; detail?: string };
 
 // Keep in sync with src/types/runtime.ts (canonical) and src/types/electron.d.ts
-export type RuntimeProfile = 'gpu' | 'cpu' | 'vulkan' | 'metal';
+export type RuntimeProfile = 'gpu' | 'cpu' | 'vulkan' | 'vulkan-wsl2' | 'metal';
+
+export interface WslSupport {
+  available: boolean;
+  gpuPassthroughDetected: boolean;
+  reason?: string;
+}
 export type HfTokenDecision = 'unset' | 'provided' | 'skipped';
 export type ClientLogType = 'info' | 'success' | 'error' | 'warning';
 
@@ -140,7 +146,43 @@ export interface ElectronAPI {
     getRuntimeKind: () => Promise<string | null>;
     getDetectionGuidance: () => Promise<string | null>;
     getComposeAvailable: () => Promise<boolean>;
-    checkGpu: () => Promise<{ gpu: boolean; toolkit: boolean; vulkan: boolean }>;
+    checkGpu: () => Promise<{
+      gpu: boolean;
+      toolkit: boolean;
+      vulkan: boolean;
+      wslSupport?: WslSupport;
+    }>;
+    resetGpuCache: () => Promise<void>;
+    hasVulkanWsl2SidecarImage: () => Promise<boolean>;
+    validateGpuPreflight: () => Promise<{
+      status: 'healthy' | 'warning' | 'unknown';
+      checks: Array<{
+        name: string;
+        pass: boolean;
+        fixCommand?: string;
+        docsUrl?: string;
+      }>;
+    }>;
+    runGpuDiagnostic: () => Promise<{
+      status: 'completed' | 'unsupported' | 'script-missing';
+      logPath?: string;
+      scriptPath?: string;
+      manualCommand?: string;
+      summary?: {
+        passCount: number;
+        warnCount: number;
+        failCount: number;
+        parsed: boolean;
+        issues: Array<{
+          status: 'PASS' | 'WARN' | 'FAIL' | 'INFO';
+          checkNumber: number;
+          title: string;
+          detail: string;
+          suggestedCommand?: string;
+        }>;
+      };
+      exitCode?: number;
+    }>;
     listImages: () => Promise<
       Array<{ tag: string; fullName: string; size: string; created: string; id: string }>
     >;
@@ -176,6 +218,8 @@ export interface ElectronAPI {
     ) => Promise<Record<string, { exists: boolean; size?: string }>>;
     removeModelCache: (modelId: string) => Promise<void>;
     downloadModelToCache: (modelId: string) => Promise<void>;
+    isGgmlModelDownloadedOnHost: (fileName: string) => Promise<boolean>;
+    downloadGgmlModelToHost: (fileName: string) => Promise<void>;
     removeVolume: (name: string) => Promise<string>;
     readComposeEnvValue: (key: string) => Promise<string | null>;
     volumeExists: (name: string) => Promise<boolean>;
@@ -362,6 +406,14 @@ export interface ElectronAPI {
     getDownloadsPath: () => Promise<string>;
     writeText: (filePath: string, content: string) => Promise<void>;
     selectFolder: () => Promise<string | null>;
+    /**
+     * Issue #104, Story 3.5 — native file-save dialog. Returns the user-
+     * chosen absolute path, or null if cancelled.
+     */
+    saveFile: (opts: {
+      defaultPath?: string;
+      filters?: { name: string; extensions: string[] }[];
+    }) => Promise<string | null>;
   };
   watcher: {
     startSession: (folderPath: string) => Promise<void>;
@@ -399,6 +451,11 @@ export interface ElectronAPI {
     stop: () => Promise<void>;
     getStatus: () => Promise<'stopped' | 'starting' | 'running' | 'stopping' | 'error'>;
     getLogs: (tail?: number) => Promise<string[]>;
+    downloadModelToCache: (modelId: string) => Promise<void>;
+    checkModelsCached: (
+      modelIds: string[],
+    ) => Promise<Record<string, { exists: boolean; size?: string }>>;
+    removeModelCache: (modelId: string) => Promise<void>;
     onStatusChanged: (
       callback: (status: 'stopped' | 'starting' | 'running' | 'stopping' | 'error') => void,
     ) => () => void;
@@ -473,6 +530,11 @@ contextBridge.exposeInMainWorld('electronAPI', {
       ipcRenderer.invoke('docker:getDetectionGuidance') as Promise<string | null>,
     getComposeAvailable: () => ipcRenderer.invoke('docker:getComposeAvailable') as Promise<boolean>,
     checkGpu: () => ipcRenderer.invoke('docker:checkGpu'),
+    resetGpuCache: () => ipcRenderer.invoke('docker:resetGpuCache') as Promise<void>,
+    hasVulkanWsl2SidecarImage: () =>
+      ipcRenderer.invoke('docker:hasVulkanWsl2SidecarImage') as Promise<boolean>,
+    validateGpuPreflight: () => ipcRenderer.invoke('docker:validateGpuPreflight'),
+    runGpuDiagnostic: () => ipcRenderer.invoke('docker:runGpuDiagnostic'),
     listImages: () => ipcRenderer.invoke('docker:listImages'),
     listRemoteTags: () =>
       ipcRenderer.invoke('docker:listRemoteTags') as Promise<
@@ -506,6 +568,10 @@ contextBridge.exposeInMainWorld('electronAPI', {
       ipcRenderer.invoke('docker:removeModelCache', modelId) as Promise<void>,
     downloadModelToCache: (modelId: string) =>
       ipcRenderer.invoke('docker:downloadModelToCache', modelId) as Promise<void>,
+    isGgmlModelDownloadedOnHost: (fileName: string) =>
+      ipcRenderer.invoke('docker:isGgmlModelDownloadedOnHost', fileName) as Promise<boolean>,
+    downloadGgmlModelToHost: (fileName: string) =>
+      ipcRenderer.invoke('docker:downloadGgmlModelToHost', fileName) as Promise<void>,
     removeVolume: (name: string) => ipcRenderer.invoke('docker:removeVolume', name),
     readComposeEnvValue: (key: string) =>
       ipcRenderer.invoke('docker:readComposeEnvValue', key) as Promise<string | null>,
@@ -682,6 +748,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
     writeText: (filePath: string, content: string) =>
       ipcRenderer.invoke('file:writeText', filePath, content) as Promise<void>,
     selectFolder: () => ipcRenderer.invoke('dialog:selectFolder') as Promise<string | null>,
+    saveFile: (opts) => ipcRenderer.invoke('dialog:saveFile', opts) as Promise<string | null>,
   },
   watcher: {
     startSession: (folderPath: string) =>
@@ -733,6 +800,14 @@ contextBridge.exposeInMainWorld('electronAPI', {
         'stopped' | 'starting' | 'running' | 'stopping' | 'error'
       >,
     getLogs: (tail?: number) => ipcRenderer.invoke('mlx:getLogs', tail) as Promise<string[]>,
+    downloadModelToCache: (modelId: string) =>
+      ipcRenderer.invoke('mlx:downloadModelToCache', modelId) as Promise<void>,
+    checkModelsCached: (modelIds: string[]) =>
+      ipcRenderer.invoke('mlx:checkModelsCached', modelIds) as Promise<
+        Record<string, { exists: boolean; size?: string }>
+      >,
+    removeModelCache: (modelId: string) =>
+      ipcRenderer.invoke('mlx:removeModelCache', modelId) as Promise<void>,
     onStatusChanged: (
       callback: (status: 'stopped' | 'starting' | 'running' | 'stopping' | 'error') => void,
     ) => {

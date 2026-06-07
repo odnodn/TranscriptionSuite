@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
+import React, { useState, useEffect, useLayoutEffect, useRef, useCallback, useMemo } from 'react';
 import { createPortal } from 'react-dom';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
@@ -27,15 +27,31 @@ import {
   ChevronDown,
   RotateCw,
   Copy,
+  MoreHorizontal,
+  Download,
 } from 'lucide-react';
 import { Button } from '../ui/Button';
 import { StatusLight } from '../ui/StatusLight';
 import { AudioVisualizer } from '../AudioVisualizer';
 import { useRecording } from '../../src/hooks/useRecording';
 import { apiClient } from '../../src/api/client';
+import { FindReplaceTextEditor } from '../editor/FindReplaceTextEditor';
+import { flattenSegmentsToText } from '../../src/services/transcriptFlatten';
 import { toast } from 'sonner';
 import { useConfirm } from '../../src/hooks/useConfirm';
+import { ConfidenceChip } from '../recording/ConfidenceChip';
+import { DeleteRecordingDialog } from '../recording/DeleteRecordingDialog';
+import { SpeakerRenameInput } from '../recording/SpeakerRenameInput';
+import { AutoActionStatusBadge, statusToBadgeProps } from '../recording/AutoActionStatusBadge';
+import { useAutoActionRetry } from '../../src/hooks/useAutoActionRetry';
+import { PersistentInfoBanner } from '../ui/PersistentInfoBanner';
+import { useActiveProfileStore } from '../../src/stores/activeProfileStore';
+import { useDiarizationConfidence } from '../../src/hooks/useDiarizationConfidence';
+import { useDiarizationReview } from '../../src/hooks/useDiarizationReview';
 import { useWordHighlighter } from '../../src/hooks/useWordHighlighter';
+import { useRecordingAliases } from '../../src/hooks/useRecordingAliases';
+import { buildSpeakerLabelMap, labelFor } from '../../src/utils/aliasSubstitution';
+import { LOW_CONFIDENCE_THRESHOLD } from '../../src/utils/confidenceBuckets';
 import { getConfig } from '../../src/config/store';
 import type { ChatMessage, Conversation, LLMModel } from '../../src/api/types';
 
@@ -415,6 +431,10 @@ export const AudioNoteModal: React.FC<AudioNoteModalProps> = ({
   note,
 }) => {
   const { confirm, dialog: confirmDialog } = useConfirm();
+  const activeProfileId = useActiveProfileStore((s) => s.activeProfileId);
+  // Issue #104, Story 3.7 — DeleteRecordingDialog state for the
+  // recording-delete affordance in the options menu.
+  const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
 
   // Portal Container State
   const [portalContainer, setPortalContainer] = useState<HTMLElement | null>(null);
@@ -447,6 +467,75 @@ export const AudioNoteModal: React.FC<AudioNoteModalProps> = ({
   const summaryEditRef = useRef<HTMLTextAreaElement>(null);
   const summarySaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
+  // Transcript editing state (non-destructive). Mirrors the Summary edit chain:
+  // debounced 2s autosave to the additive transcript_corrected column, silent
+  // fail + retry on next keystroke. Original segments are never touched.
+  const [correctedTranscript, setCorrectedTranscript] = useState<string | null>(null);
+  const [isTranscriptEditing, setIsTranscriptEditing] = useState(false);
+  const [transcriptDraft, setTranscriptDraft] = useState('');
+  const [isTranscriptSaving, setIsTranscriptSaving] = useState(false);
+  const transcriptSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Text as loaded into the editor; a correction is only persisted when the
+  // draft actually diverges from this seed (so "Done" with no edits is a no-op).
+  const transcriptSeedRef = useRef('');
+
+  // Sticky-header scroll affordance: once the Transcript header sticks to the top
+  // of the scroll container, the "TRANSCRIPT" chip fades out and the edit controls
+  // glide to the right edge of the transcript box (FLIP-animated; see below).
+  const transcriptHeaderRef = useRef<HTMLDivElement | null>(null);
+  const transcriptControlsRef = useRef<HTMLDivElement | null>(null);
+  const transcriptControlsLeftRef = useRef<number | null>(null);
+  const [isTranscriptHeaderStuck, setIsTranscriptHeaderStuck] = useState(false);
+
+  // Detect when the sticky Transcript header pins to the top of the scroll
+  // container. position:sticky pins relative to the scroll container's CONTENT
+  // box, so the stuck header.top settles at container.top + padding-top (the
+  // container has p-8) — not container.top. rAF-throttled; bails when there is no
+  // layout (e.g. jsdom in tests), leaving the header unstuck so the chip +
+  // left-aligned controls render normally.
+  useEffect(() => {
+    const root = transcriptContainerRef.current;
+    const header = transcriptHeaderRef.current;
+    if (!root || !header) return;
+    let raf = 0;
+    const padTop = parseFloat(getComputedStyle(root).paddingTop) || 0;
+    const update = () => {
+      raf = 0;
+      const rootRect = root.getBoundingClientRect();
+      if (rootRect.height === 0) return; // no layout — leave the header unstuck
+      const stuck = header.getBoundingClientRect().top <= rootRect.top + padTop + 1;
+      setIsTranscriptHeaderStuck((prev) => (prev === stuck ? prev : stuck));
+    };
+    const onScroll = () => {
+      if (!raf) raf = requestAnimationFrame(update);
+    };
+    update();
+    root.addEventListener('scroll', onScroll, { passive: true });
+    return () => {
+      root.removeEventListener('scroll', onScroll);
+      if (raf) cancelAnimationFrame(raf);
+    };
+  }, [isRendered, portalContainer, note]);
+
+  // FLIP the edit-control group when stuck toggles: counter-translate by the
+  // layout delta, then transition back to 0 so it slides between the left
+  // (next to the chip) and right (top-right of the box) positions.
+  useLayoutEffect(() => {
+    const el = transcriptControlsRef.current;
+    if (!el) return;
+    const newLeft = el.getBoundingClientRect().left;
+    const prevLeft = transcriptControlsLeftRef.current;
+    transcriptControlsLeftRef.current = newLeft;
+    if (prevLeft === null) return; // first measurement — nothing to animate from
+    const dx = prevLeft - newLeft;
+    if (Math.abs(dx) < 1) return;
+    el.style.transition = 'none';
+    el.style.transform = `translateX(${dx}px)`;
+    void el.offsetWidth; // flush the start frame so the transition has somewhere to go
+    el.style.transition = 'transform 320ms cubic-bezier(0.22, 1, 0.36, 1)';
+    el.style.transform = 'translateX(0)';
+  }, [isTranscriptHeaderStuck]);
+
   // Date editing state
   const [isDateEditing, setIsDateEditing] = useState(false);
   const [dateEditValue, setDateEditValue] = useState('');
@@ -473,6 +562,16 @@ export const AudioNoteModal: React.FC<AudioNoteModalProps> = ({
     currentTitle: string;
   } | null>(null);
   const [renameValue, setRenameValue] = useState('');
+
+  // GH #96: Recording-level options menu (Rename / Export / Delete) shown in
+  // the modal header. Mirrors the row-level NoteActionMenu in NotebookView so
+  // users can manage the recording without closing the modal first.
+  const [optionsMenuOpen, setOptionsMenuOpen] = useState(false);
+  const [recordingRenameDialog, setRecordingRenameDialog] = useState<{
+    currentTitle: string;
+  } | null>(null);
+  const [recordingRenameValue, setRecordingRenameValue] = useState('');
+  const [recordingRenameLoading, setRecordingRenameLoading] = useState(false);
 
   // Chat Sessions — fetched from API when recording is available
   const [chatSessions, setChatSessions] = useState<ChatSession[]>([]);
@@ -529,6 +628,76 @@ export const AudioNoteModal: React.FC<AudioNoteModalProps> = ({
   const segments = transcription?.segments ?? [];
   const hasDiarizationTranscript =
     Boolean(recording?.has_diarization) || segments.some((seg) => Boolean(seg.speaker));
+
+  // Issue #104, Stories 4.3 / 4.4 — Speaker aliases for the active recording.
+  // The hook is the single source of truth: rename commits via setAliases
+  // and every turn re-renders with the new label in the same React pass
+  // (FR22 / "applies to all turns of the same speaker_id").
+  const recordingId = note?.recordingId ?? null;
+  const aliasState = useRecordingAliases(recordingId);
+  const speakerLabelMap = useMemo(
+    () => buildSpeakerLabelMap(segments, aliasState.aliasMap),
+    [segments, aliasState.aliasMap],
+  );
+  const handleSpeakerRename = useCallback(
+    (speakerId: string, newName: string) => {
+      const trimmed = newName.trim();
+      const next = aliasState.aliases.filter((a) => a.speaker_id !== speakerId);
+      if (trimmed) next.push({ speaker_id: speakerId, alias_name: trimmed });
+      aliasState.setAliases(next).catch(() => {
+        toast.error('Failed to update speaker label');
+      });
+    },
+    [aliasState],
+  );
+
+  // Issue #104 Story 5.5 — per-turn diarization confidence for chip rendering.
+  // Older recordings without word-level confidence return turns:[] which
+  // renders no chips at all (graceful fallback).
+  const confidenceState = useDiarizationConfidence(recordingId);
+
+  // Issue #104 Story 5.7 — review state drives the persistent banner.
+  const reviewState = useDiarizationReview(recordingId);
+
+  // Issue #104 Sprint 4 deferred-work no. 3 — surface the auto-summary /
+  // auto-export lifecycle status. statusToBadgeProps returns null when the
+  // backend column is null (toggle off / not run yet) so the badge simply
+  // does not render in those cases.
+  const autoActionRetry = useAutoActionRetry(recordingId ?? 0);
+  const summaryBadgeProps = statusToBadgeProps(
+    recording?.auto_summary_status ?? null,
+    'auto_summary',
+    { error: recording?.auto_summary_error ?? null },
+  );
+  const exportBadgeProps = statusToBadgeProps(
+    recording?.auto_export_status ?? null,
+    'auto_export',
+    {
+      error: recording?.auto_export_error ?? null,
+      path: recording?.auto_export_path ?? null,
+    },
+  );
+  // Sprint 5 — Story 7.7: third badge for the per-recording webhook
+  // delivery status. The backend exposes the latest webhook_deliveries
+  // row's status + last_error directly on the GET response.
+  const webhookBadgeProps = statusToBadgeProps(recording?.webhook_status ?? null, 'webhook', {
+    error: recording?.webhook_error ?? null,
+  });
+  const lowConfTurnCount = useMemo(() => {
+    let n = 0;
+    for (const t of confidenceState.turns) {
+      if (t.confidence < LOW_CONFIDENCE_THRESHOLD) n += 1;
+    }
+    return n;
+  }, [confidenceState.turns]);
+  const totalTurnCount = confidenceState.turns.length;
+  const handleOpenReview = useCallback(() => {
+    reviewState.openReview().catch(() => {
+      toast.error('Failed to open review');
+    });
+    // Story 5.9 review view (commit I) opens here. For commit H we
+    // expose only the lifecycle transition; the dedicated view ships next.
+  }, [reviewState]);
   const hasWordTimestamps = segments.some((seg) => seg.words && seg.words.length > 0);
   const hasSegmentDetail = hasDiarizationTranscript || hasWordTimestamps;
   const plainTranscriptText = hasSegmentDetail
@@ -573,6 +742,7 @@ export const AudioNoteModal: React.FC<AudioNoteModalProps> = ({
       setSummaryExpanded(false);
       setSummaryText('');
       setIsGenerating(false);
+      setIsTranscriptEditing(false);
       apiClient
         .getLLMStatus()
         .then((s) => {
@@ -807,6 +977,89 @@ export const AudioNoteModal: React.FC<AudioNoteModalProps> = ({
     [note?.recordingId, summaryText, handleSaveSummary],
   );
 
+  // Seed the local corrected transcript from the recording (load / switch).
+  useEffect(() => {
+    setCorrectedTranscript(recording?.transcript_corrected ?? null);
+  }, [recording?.transcript_corrected]);
+
+  // Cancel any pending autosave on unmount so it cannot fire after teardown.
+  useEffect(
+    () => () => {
+      if (transcriptSaveTimerRef.current) clearTimeout(transcriptSaveTimerRef.current);
+    },
+    [],
+  );
+
+  const hasCorrected = !!correctedTranscript?.trim();
+
+  const handleSaveCorrectedTranscript = useCallback(
+    async (text: string) => {
+      if (!recordingId) return;
+      const value = text.trim() ? text : undefined; // blank text → clear (revert)
+      setIsTranscriptSaving(true);
+      try {
+        await apiClient.updateRecordingCorrectedTranscript(recordingId, value);
+        setCorrectedTranscript(value ?? null);
+      } catch {
+        // silently fail — user can retry on next keystroke (mirror Summary)
+      } finally {
+        setIsTranscriptSaving(false);
+      }
+    },
+    [recordingId],
+  );
+
+  const handleEnterTranscriptEdit = useCallback(() => {
+    const seed = correctedTranscript ?? flattenSegmentsToText(segments);
+    transcriptSeedRef.current = seed;
+    setTranscriptDraft(seed);
+    setIsTranscriptEditing(true);
+  }, [correctedTranscript, segments]);
+
+  const handleTranscriptEditChange = useCallback(
+    (text: string) => {
+      setTranscriptDraft(text);
+      // Debounced auto-save (2s after the user stops typing). Skip when the text
+      // is unchanged from the loaded seed — never persist a no-op "correction".
+      if (transcriptSaveTimerRef.current) clearTimeout(transcriptSaveTimerRef.current);
+      transcriptSaveTimerRef.current = setTimeout(() => {
+        if (text !== transcriptSeedRef.current) handleSaveCorrectedTranscript(text);
+      }, 2000);
+    },
+    [handleSaveCorrectedTranscript],
+  );
+
+  const handleExitTranscriptEdit = useCallback(
+    (save: boolean) => {
+      if (transcriptSaveTimerRef.current) {
+        clearTimeout(transcriptSaveTimerRef.current);
+        transcriptSaveTimerRef.current = null;
+      }
+      // Only persist when the draft actually diverges from what was loaded —
+      // clicking "Done" without editing must NOT create a flattened correction.
+      if (save && transcriptDraft !== transcriptSeedRef.current) {
+        handleSaveCorrectedTranscript(transcriptDraft);
+      }
+      setIsTranscriptEditing(false);
+    },
+    [transcriptDraft, handleSaveCorrectedTranscript],
+  );
+
+  const handleRevertTranscript = useCallback(async () => {
+    if (transcriptSaveTimerRef.current) {
+      clearTimeout(transcriptSaveTimerRef.current);
+      transcriptSaveTimerRef.current = null;
+    }
+    if (!recordingId) return;
+    try {
+      await apiClient.updateRecordingCorrectedTranscript(recordingId, undefined);
+      setCorrectedTranscript(null);
+      setIsTranscriptEditing(false);
+    } catch {
+      // silently fail — original segments are intact regardless
+    }
+  }, [recordingId]);
+
   const handleClearSummary = useCallback(async () => {
     if (!note?.recordingId) return;
     if (
@@ -978,6 +1231,53 @@ export const AudioNoteModal: React.FC<AudioNoteModalProps> = ({
       'Audio playback failed. The source may be unavailable or in an unsupported format.',
     );
   };
+
+  // GH #97: Keyboard shortcuts for playback while the modal is open.
+  // Reads audio.paused directly (not React's isPlaying) so the closure can
+  // never go stale between renders, which lets us register the listener once
+  // per modal-open instead of every render.
+  useEffect(() => {
+    if (!isOpen || note?.recordingId == null) return;
+
+    const handler = (event: KeyboardEvent) => {
+      const target = event.target as HTMLElement | null;
+      if (target) {
+        const tag = target.tagName;
+        if (tag === 'INPUT' || tag === 'TEXTAREA' || target.isContentEditable) return;
+      }
+      if (event.ctrlKey || event.metaKey || event.altKey) return;
+
+      const audio = audioRef.current;
+      if (!audio) return;
+
+      const key = event.key.toLowerCase();
+      const isPlayPause = event.code === 'Space' || key === 'k';
+      const isBack = key === 'j';
+      const isForward = key === 'l';
+      if (!isPlayPause && !isBack && !isForward) return;
+
+      event.preventDefault();
+
+      if (isPlayPause) {
+        if (audio.paused) {
+          audio.play().catch(() => {
+            setAudioError(
+              'Unable to start playback. Check that the audio file is available and the server is reachable.',
+            );
+          });
+        } else {
+          audio.pause();
+        }
+        return;
+      }
+
+      const delta = isBack ? -10 : 10;
+      audio.currentTime = Math.max(0, Math.min(audio.duration || 0, audio.currentTime + delta));
+    };
+
+    document.addEventListener('keydown', handler);
+    return () => document.removeEventListener('keydown', handler);
+  }, [isOpen, note?.recordingId]);
 
   // LLM Chat handler — sends user message and streams assistant response
   const handleSendMessage = useCallback(
@@ -1337,6 +1637,178 @@ export const AudioNoteModal: React.FC<AudioNoteModalProps> = ({
     }
   }, [note?.recordingId, dateEditValue, onRecordingMutated, onClose]);
 
+  // GH #96: close the recording-options dropdown on outside click. Mirrors
+  // the modelDropdownOpen pattern above so the two dropdowns behave the same.
+  useEffect(() => {
+    if (!optionsMenuOpen) return;
+    const handler = () => setOptionsMenuOpen(false);
+    const id = setTimeout(() => document.addEventListener('click', handler), 0);
+    return () => {
+      clearTimeout(id);
+      document.removeEventListener('click', handler);
+    };
+  }, [optionsMenuOpen]);
+
+  // GH #96 (review): reset recording-options state whenever the modal closes
+  // so a half-open menu / half-typed rename does not persist into the next
+  // session and the document click listener does not leak.
+  useEffect(() => {
+    if (isOpen) return;
+    setOptionsMenuOpen(false);
+    setRecordingRenameDialog(null);
+    setRecordingRenameValue('');
+    setRecordingRenameLoading(false);
+  }, [isOpen]);
+
+  /** Open the recording rename portal, prefilled with the current title. */
+  const handleRecordingRenameOpen = useCallback(() => {
+    const currentTitle = recording?.title ?? note?.title ?? '';
+    setRecordingRenameValue(currentTitle);
+    setRecordingRenameDialog({ currentTitle });
+    setOptionsMenuOpen(false);
+  }, [recording?.title, note?.title]);
+
+  /** Commit a recording rename. No-op when the title is unchanged or empty. */
+  const handleRecordingRenameCommit = useCallback(async () => {
+    if (!recordingRenameDialog || !note?.recordingId) return;
+    if (recordingRenameLoading) return; // GH #96 (review): block double-Enter
+    const trimmed = recordingRenameValue.trim();
+    if (!trimmed || trimmed === recordingRenameDialog.currentTitle) {
+      setRecordingRenameDialog(null);
+      return;
+    }
+    setRecordingRenameLoading(true);
+    try {
+      await apiClient.updateRecordingTitle(note.recordingId, trimmed);
+      onRecordingMutated?.();
+      setRecordingRenameDialog(null);
+    } catch {
+      toast.error('Failed to rename recording.');
+    } finally {
+      setRecordingRenameLoading(false);
+    }
+  }, [
+    recordingRenameDialog,
+    recordingRenameValue,
+    recordingRenameLoading,
+    note?.recordingId,
+    onRecordingMutated,
+  ]);
+
+  /** Open the recording export download for the requested format. */
+  const handleRecordingExport = useCallback(
+    (format: 'txt' | 'srt' | 'ass') => {
+      setOptionsMenuOpen(false);
+      if (!note?.recordingId) return;
+      const url = apiClient.getExportUrl(note.recordingId, format);
+      if (url === null) {
+        toast.error('Remote host not configured. Open Settings → Connection.');
+        return;
+      }
+      // GH #96 (review): noopener,noreferrer prevents the new context from
+      // accessing window.opener and avoids referrer leakage to the export URL.
+      window.open(url, '_blank', 'noopener,noreferrer');
+    },
+    [note?.recordingId],
+  );
+
+  /**
+   * Issue #104, Story 3.5 — download the FR9-format plain-text transcript
+   * via the native OS file-save dialog. Uses the new `format=plaintext`
+   * branch on the export route (StreamingResponse, paragraph per speaker
+   * turn, no subtitle timestamps).
+   */
+  const handleDownloadPlaintextTranscript = useCallback(async () => {
+    setOptionsMenuOpen(false);
+    if (!note?.recordingId) return;
+    const url = apiClient.getExportUrl(note.recordingId, 'plaintext' as never);
+    if (url === null) {
+      toast.error('Remote host not configured. Open Settings → Connection.');
+      return;
+    }
+    const fileIO = window.electronAPI?.fileIO;
+    if (!fileIO?.saveFile || !fileIO.writeText) {
+      // Fallback: just open the URL — browser will save via its own dialog.
+      window.open(url, '_blank', 'noopener,noreferrer');
+      return;
+    }
+    try {
+      const defaultName = `${(note.title || 'recording').replace(/\s+/g, '_')}.txt`;
+      const target = await fileIO.saveFile({
+        defaultPath: defaultName,
+        filters: [{ name: 'Text', extensions: ['txt'] }],
+      });
+      if (!target) return;
+      const response = await fetch(url);
+      if (!response.ok) throw new Error(`Server returned ${response.status}`);
+      const content = await response.text();
+      await fileIO.writeText(target, content);
+      toast.success(`Transcript saved to ${target}`);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Unknown error';
+      toast.error(`Could not save transcript: ${message}`);
+    }
+  }, [note?.recordingId, note?.title]);
+
+  /** Story 3.5 — download the AI summary as plain text. */
+  const handleDownloadPlaintextSummary = useCallback(async () => {
+    setOptionsMenuOpen(false);
+    if (!note?.recordingId || !summaryText) return;
+    const fileIO = window.electronAPI?.fileIO;
+    if (!fileIO?.saveFile || !fileIO.writeText) {
+      toast.error('Save dialog unavailable in this environment.');
+      return;
+    }
+    try {
+      const defaultName = `${(note.title || 'recording').replace(/\s+/g, '_')}_summary.txt`;
+      const target = await fileIO.saveFile({
+        defaultPath: defaultName,
+        filters: [{ name: 'Text', extensions: ['txt'] }],
+      });
+      if (!target) return;
+      await fileIO.writeText(target, summaryText);
+      toast.success(`Summary saved to ${target}`);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Unknown error';
+      toast.error(`Could not save summary: ${message}`);
+    }
+  }, [note?.recordingId, note?.title, summaryText]);
+
+  /** Open the deletion dialog. Actual deletion fires from
+   * handleConfirmRecordingDelete after the user picks options.
+   */
+  const handleRecordingDelete = useCallback(() => {
+    setOptionsMenuOpen(false);
+    if (!note?.recordingId) return;
+    setDeleteDialogOpen(true);
+  }, [note?.recordingId]);
+
+  const handleConfirmRecordingDelete = useCallback(
+    async (deleteArtifacts: boolean) => {
+      setDeleteDialogOpen(false);
+      if (!note?.recordingId) return;
+      try {
+        const result = await apiClient.deleteRecording(note.recordingId, {
+          deleteArtifacts,
+          artifactProfileId: deleteArtifacts ? activeProfileId : null,
+        });
+        onRecordingMutated?.();
+        if (result.artifact_failures?.length) {
+          toast.error(
+            `Recording deleted, but ${result.artifact_failures.length} on-disk file(s) could not be removed.`,
+          );
+        } else {
+          toast.success('Recording deleted.');
+        }
+        onClose();
+      } catch (err) {
+        const message = err instanceof Error ? err.message : 'Failed to delete recording.';
+        toast.error(message);
+      }
+    },
+    [note?.recordingId, activeProfileId, onRecordingMutated, onClose],
+  );
+
   if (!isRendered || !note || !portalContainer) return createPortal(confirmDialog, document.body);
 
   return (
@@ -1344,6 +1816,12 @@ export const AudioNoteModal: React.FC<AudioNoteModalProps> = ({
       {/* Render confirmDialog and renameDialog via portals to document.body so they
           always appear above the modal (z-9999), regardless of stacking context. */}
       {createPortal(confirmDialog, document.body)}
+      <DeleteRecordingDialog
+        open={deleteDialogOpen}
+        recordingName={note.title || 'this recording'}
+        onCancel={() => setDeleteDialogOpen(false)}
+        onConfirm={handleConfirmRecordingDelete}
+      />
       {renameDialog &&
         createPortal(
           <div className="fixed inset-0 z-10000 flex items-center justify-center p-4">
@@ -1351,7 +1829,7 @@ export const AudioNoteModal: React.FC<AudioNoteModalProps> = ({
               className="absolute inset-0 bg-black/60 backdrop-blur-sm"
               onClick={() => setRenameDialog(null)}
             />
-            <div className="relative flex w-full max-w-sm flex-col overflow-hidden rounded-3xl border border-white/10 bg-black/60 shadow-2xl backdrop-blur-xl">
+            <div className="blur-panel relative flex w-full max-w-sm flex-col overflow-hidden rounded-3xl border border-white/10 bg-black/60 shadow-2xl backdrop-blur-xl">
               <div className="flex items-center border-b border-white/10 bg-white/5 px-6 py-4">
                 <span className="text-base font-semibold text-white">Rename Session</span>
               </div>
@@ -1386,6 +1864,52 @@ export const AudioNoteModal: React.FC<AudioNoteModalProps> = ({
           </div>,
           document.body,
         )}
+      {/* GH #96: Recording-rename dialog (separate from the chat-session rename above). */}
+      {recordingRenameDialog &&
+        createPortal(
+          <div className="fixed inset-0 z-10000 flex items-center justify-center p-4">
+            <div
+              className="absolute inset-0 bg-black/60 backdrop-blur-sm"
+              onClick={() => setRecordingRenameDialog(null)}
+            />
+            <div className="blur-panel relative flex w-full max-w-sm flex-col overflow-hidden rounded-3xl border border-white/10 bg-black/60 shadow-2xl backdrop-blur-xl">
+              <div className="flex items-center border-b border-white/10 bg-white/5 px-6 py-4">
+                <span className="text-base font-semibold text-white">Rename Recording</span>
+              </div>
+              <div className="bg-black/20 px-6 py-5">
+                <input
+                  autoFocus
+                  type="text"
+                  value={recordingRenameValue}
+                  onChange={(e) => setRecordingRenameValue(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') handleRecordingRenameCommit();
+                    if (e.key === 'Escape') setRecordingRenameDialog(null);
+                  }}
+                  className="focus:border-accent-cyan/50 w-full rounded-lg border border-white/10 bg-black/20 px-3 py-2 text-sm text-white focus:outline-none"
+                />
+              </div>
+              <div className="flex justify-end gap-3 border-t border-white/10 bg-white/5 px-6 py-4">
+                <button
+                  onClick={() => setRecordingRenameDialog(null)}
+                  disabled={recordingRenameLoading}
+                  className="rounded-lg px-4 py-2 text-sm text-slate-400 hover:text-white disabled:opacity-50"
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={handleRecordingRenameCommit}
+                  disabled={recordingRenameLoading}
+                  className="bg-accent-cyan flex items-center gap-2 rounded-lg px-4 py-2 text-sm font-medium text-black hover:bg-cyan-300 disabled:opacity-50"
+                >
+                  {recordingRenameLoading && <Loader2 size={14} className="animate-spin" />}
+                  Rename
+                </button>
+              </div>
+            </div>
+          </div>,
+          document.body,
+        )}
       {createPortal(
         <div className="fixed inset-0 z-9999 flex items-center justify-center p-4 lg:p-8">
           {/* Backdrop */}
@@ -1396,7 +1920,7 @@ export const AudioNoteModal: React.FC<AudioNoteModalProps> = ({
 
           {/* Main Modal Container */}
           <div
-            className={`bg-glass-surface relative flex h-[85vh] w-full max-w-6xl overflow-hidden rounded-3xl border border-white/10 shadow-2xl backdrop-blur-xl transition-all duration-500 ease-[cubic-bezier(0.32,0.72,0,1)] ${isVisible ? 'translate-y-0 opacity-100' : 'translate-y-[100vh] opacity-0'}`}
+            className={`blur-panel bg-glass-surface relative flex h-[85vh] w-full max-w-6xl overflow-hidden rounded-3xl border border-white/10 shadow-2xl backdrop-blur-xl transition-all duration-500 ease-[cubic-bezier(0.32,0.72,0,1)] ${isVisible ? 'translate-y-0 opacity-100' : 'translate-y-[100vh] opacity-0'}`}
           >
             {/* Left Section: Content & Player */}
             <div className="flex min-w-0 flex-1 flex-col bg-linear-to-b from-white/5 to-transparent">
@@ -1471,6 +1995,90 @@ export const AudioNoteModal: React.FC<AudioNoteModalProps> = ({
                       <div className="mx-1 h-8 w-px bg-white/10"></div>
                     </>
                   )}
+                  {/* GH #96: Recording-options menu (Rename / Export / Delete).
+                      Disabled while the recording is still loading so users
+                      can't act on a half-fetched note (matches AC1 / edge-case
+                      matrix). Tokens match the existing chat-session contextMenu
+                      below for visual consistency (bg-slate-900 + border-slate-900). */}
+                  {note.recordingId != null && (
+                    <div className="relative">
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          if (recordingLoading) return;
+                          setOptionsMenuOpen((v) => !v);
+                        }}
+                        disabled={recordingLoading}
+                        title={recordingLoading ? 'Loading recording…' : 'More options'}
+                        className="rounded-full p-2 text-slate-400 transition-colors hover:bg-white/10 hover:text-white disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-transparent disabled:hover:text-slate-400"
+                      >
+                        <MoreHorizontal size={22} />
+                      </button>
+                      {optionsMenuOpen && (
+                        <div
+                          className="animate-in fade-in zoom-in-95 absolute top-full right-0 z-50 mt-2 w-48 overflow-hidden rounded-xl border border-slate-900 bg-slate-900 py-1 shadow-2xl duration-100 select-none"
+                          onClick={(e) => e.stopPropagation()}
+                        >
+                          <button
+                            onClick={handleRecordingRenameOpen}
+                            className="flex w-full items-center gap-2 px-4 py-2 text-left text-sm text-slate-300 hover:bg-white/10 hover:text-white"
+                          >
+                            <Edit2 size={14} /> Rename
+                          </button>
+                          {/* Issue #104, Story 3.5 — Download transcript /
+                              Download summary use the new plain-text streaming
+                              format + native save dialog. The verbose Export
+                              TXT/SRT/ASS items below stay for power users. */}
+                          <button
+                            onClick={handleDownloadPlaintextTranscript}
+                            aria-label="Download transcript as plain text"
+                            className="flex w-full items-center gap-2 px-4 py-2 text-left text-sm text-slate-300 hover:bg-white/10 hover:text-white"
+                          >
+                            <Download size={14} /> Download transcript
+                          </button>
+                          <button
+                            onClick={handleDownloadPlaintextSummary}
+                            aria-label="Download summary as plain text"
+                            disabled={!summaryText}
+                            title={
+                              summaryText
+                                ? undefined
+                                : 'No summary yet — generate from the AI panel'
+                            }
+                            className="flex w-full items-center gap-2 px-4 py-2 text-left text-sm text-slate-300 hover:bg-white/10 hover:text-white disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-transparent disabled:hover:text-slate-300"
+                          >
+                            <Download size={14} /> Download summary
+                          </button>
+                          <div className="my-1 h-px bg-white/10"></div>
+                          <button
+                            onClick={() => handleRecordingExport('txt')}
+                            className="flex w-full items-center gap-2 px-4 py-2 text-left text-sm text-slate-300 hover:bg-white/10 hover:text-white"
+                          >
+                            <Download size={14} /> Export TXT
+                          </button>
+                          <button
+                            onClick={() => handleRecordingExport('srt')}
+                            className="flex w-full items-center gap-2 px-4 py-2 text-left text-sm text-slate-300 hover:bg-white/10 hover:text-white"
+                          >
+                            <Download size={14} /> Export SRT
+                          </button>
+                          <button
+                            onClick={() => handleRecordingExport('ass')}
+                            className="flex w-full items-center gap-2 px-4 py-2 text-left text-sm text-slate-300 hover:bg-white/10 hover:text-white"
+                          >
+                            <Download size={14} /> Export ASS
+                          </button>
+                          <div className="my-1 h-px bg-white/10"></div>
+                          <button
+                            onClick={handleRecordingDelete}
+                            className="flex w-full items-center gap-2 px-4 py-2 text-left text-sm text-red-400 hover:bg-red-500/10 hover:text-red-300"
+                          >
+                            <Trash2 size={14} /> Delete
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  )}
                   <button
                     onClick={handleCloseAction}
                     className="rounded-full p-2 text-slate-400 transition-colors hover:bg-white/10 hover:text-white"
@@ -1480,11 +2088,11 @@ export const AudioNoteModal: React.FC<AudioNoteModalProps> = ({
                 </div>
               </div>
 
-              {/* Scrollable Body */}
-              <div
-                ref={transcriptContainerRef}
-                className="custom-scrollbar flex-1 space-y-8 overflow-y-auto p-8"
-              >
+              {/* GH #97: Audio Player Card lifted out of the scroll container so the
+                  controls stay visible while useWordHighlighter auto-scrolls the
+                  transcript. flex-none keeps the card a fixed slice of the left
+                  pane; the scrollable body below shrinks to fit (flex-1). */}
+              <div className="flex-none px-8 pt-8 select-none">
                 {/* 1. Audio Player Card */}
                 <div className="group relative overflow-hidden rounded-2xl border border-white/5 bg-black/20 p-6 select-none">
                   {/* Hidden audio element for playback */}
@@ -1520,13 +2128,14 @@ export const AudioNoteModal: React.FC<AudioNoteModalProps> = ({
                       <button
                         onClick={() => handleSeek(-10)}
                         className="text-slate-400 transition-colors hover:text-white"
-                        title="Rewind 10s"
+                        title="Rewind 10s (J)"
                       >
                         <Rewind size={24} />
                       </button>
                       <button
                         onClick={handlePlayPause}
                         disabled={!audioUrl}
+                        title={isPlaying ? 'Pause (Space / K)' : 'Play (Space / K)'}
                         className="flex h-14 w-14 items-center justify-center rounded-full bg-white text-black shadow-[0_0_20px_rgba(255,255,255,0.3)] transition-all hover:scale-105 active:scale-95 disabled:cursor-not-allowed disabled:opacity-50"
                       >
                         {isPlaying ? (
@@ -1538,7 +2147,7 @@ export const AudioNoteModal: React.FC<AudioNoteModalProps> = ({
                       <button
                         onClick={() => handleSeek(10)}
                         className="text-slate-400 transition-colors hover:text-white"
-                        title="Forward 10s"
+                        title="Forward 10s (L)"
                       >
                         <FastForward size={24} />
                       </button>
@@ -1557,6 +2166,55 @@ export const AudioNoteModal: React.FC<AudioNoteModalProps> = ({
                     {audioError && <div className="text-xs text-red-400">{audioError}</div>}
                   </div>
                 </div>
+              </div>
+
+              {/* Scrollable Body */}
+              <div
+                ref={transcriptContainerRef}
+                className="custom-scrollbar flex-1 space-y-8 overflow-y-auto p-8"
+              >
+                {/* Issue #104 Sprint 4 — auto-summary / auto-export status badges
+                    (Story 6.6). Each badge renders only when its corresponding
+                    backend column is non-null, so toggle-off recordings show
+                    nothing here. */}
+                {(summaryBadgeProps || exportBadgeProps || webhookBadgeProps) &&
+                  note?.recordingId && (
+                    <div className="flex flex-wrap items-center gap-2">
+                      {summaryBadgeProps && (
+                        <AutoActionStatusBadge
+                          recordingId={note.recordingId}
+                          recordingName={note.title}
+                          actionType="auto_summary"
+                          severity={summaryBadgeProps.severity}
+                          message={summaryBadgeProps.message}
+                          retryable={summaryBadgeProps.retryable}
+                          onRetry={(t) => autoActionRetry.mutate(t)}
+                        />
+                      )}
+                      {exportBadgeProps && (
+                        <AutoActionStatusBadge
+                          recordingId={note.recordingId}
+                          recordingName={note.title}
+                          actionType="auto_export"
+                          severity={exportBadgeProps.severity}
+                          message={exportBadgeProps.message}
+                          retryable={exportBadgeProps.retryable}
+                          onRetry={(t) => autoActionRetry.mutate(t)}
+                        />
+                      )}
+                      {webhookBadgeProps && (
+                        <AutoActionStatusBadge
+                          recordingId={note.recordingId}
+                          recordingName={note.title}
+                          actionType="webhook"
+                          severity={webhookBadgeProps.severity}
+                          message={webhookBadgeProps.message}
+                          retryable={webhookBadgeProps.retryable}
+                          onRetry={(t) => autoActionRetry.mutate(t)}
+                        />
+                      )}
+                    </div>
+                  )}
 
                 {/* 2. AI Summary Section - Editable */}
                 <div
@@ -1653,14 +2311,96 @@ export const AudioNoteModal: React.FC<AudioNoteModalProps> = ({
                   )}
                 </div>
 
+                {/* Issue #104 Story 5.7 — persistent low-confidence review banner.
+                    Visible while ADR-009 status is 'pending' or 'in_review'.
+                    Dismissed only by the lifecycle (R-EL20 — no time/navigation
+                    auto-dismiss). */}
+                {reviewState.bannerVisible && (
+                  <PersistentInfoBanner
+                    severity="warning"
+                    message={`⚠ Speaker labels uncertain on ${lowConfTurnCount} of ${totalTurnCount} turn boundaries — review before auto-summary runs.`}
+                    ctaLabel="Review uncertain turns"
+                    onCta={handleOpenReview}
+                    ariaAnnouncement={`Transcription complete. ${lowConfTurnCount} of ${totalTurnCount} turn boundaries flagged low-confidence.`}
+                  />
+                )}
+
                 {/* 3. Transcript - Added selectable-text to paragraphs */}
                 <div className="space-y-6">
-                  <div className="pointer-events-none sticky top-0 z-10 py-4 select-none">
-                    <span className="pointer-events-auto inline-flex items-center rounded-full border border-white/10 bg-[rgba(22,31,50,0.9)] px-4 py-1.5 text-xs font-bold tracking-widest text-slate-400 uppercase shadow-lg backdrop-blur-xl">
+                  <div
+                    ref={transcriptHeaderRef}
+                    className="pointer-events-none sticky top-0 z-10 flex items-center gap-2 py-4 select-none"
+                  >
+                    <span
+                      className={`pointer-events-auto inline-flex items-center rounded-full border border-white/10 bg-[rgba(22,31,50,0.9)] px-4 py-1.5 text-xs font-bold tracking-widest text-slate-400 uppercase shadow-lg backdrop-blur-xl transition-opacity duration-300 ${isTranscriptHeaderStuck ? 'pointer-events-none opacity-0' : 'opacity-100'}`}
+                    >
                       Transcript
                     </span>
+                    {/* Edit controls — FLIP-slid to the right when the header is stuck. */}
+                    <div
+                      ref={transcriptControlsRef}
+                      className={`flex items-center gap-2 ${isTranscriptHeaderStuck ? 'ml-auto' : ''}`}
+                    >
+                      {(segments.length > 0 || hasCorrected) &&
+                        (isTranscriptEditing ? (
+                          <button
+                            type="button"
+                            onClick={() => handleExitTranscriptEdit(true)}
+                            className="pointer-events-auto inline-flex items-center gap-1.5 rounded-full border border-emerald-400/30 bg-emerald-500/20 px-3 py-1.5 text-xs font-semibold text-emerald-200 transition hover:bg-emerald-500/30"
+                            title="Done editing"
+                          >
+                            <Check size={13} />
+                            Done
+                            {isTranscriptSaving && (
+                              <span className="font-normal text-emerald-300/70">· Saving…</span>
+                            )}
+                          </button>
+                        ) : (
+                          <>
+                            <button
+                              type="button"
+                              onClick={handleEnterTranscriptEdit}
+                              className="pointer-events-auto inline-flex h-7 w-7 items-center justify-center rounded-full border border-white/10 bg-[rgba(22,31,50,0.95)] text-slate-400 transition hover:bg-white/10 hover:text-white"
+                              title="Edit transcript"
+                              aria-label="Edit transcript"
+                            >
+                              <Pencil size={13} />
+                            </button>
+                            {hasCorrected && (
+                              <span className="pointer-events-auto inline-flex items-center gap-1.5 rounded-full border border-amber-400/25 bg-amber-500/15 px-3 py-1 text-[11px] font-semibold tracking-wide text-amber-200 uppercase">
+                                Edited
+                                <button
+                                  type="button"
+                                  onClick={handleRevertTranscript}
+                                  className="inline-flex items-center gap-1 rounded text-amber-300 transition hover:text-amber-100"
+                                  title="Revert to original transcript"
+                                  aria-label="Revert transcript"
+                                >
+                                  <RotateCw size={12} />
+                                  Revert
+                                </button>
+                              </span>
+                            )}
+                          </>
+                        ))}
+                    </div>
                   </div>
-                  {segments.length > 0 ? (
+                  {isTranscriptEditing ? (
+                    <FindReplaceTextEditor
+                      autoFocus
+                      autoGrow={false}
+                      value={transcriptDraft}
+                      onChange={handleTranscriptEditChange}
+                      ariaLabel="Edit transcript"
+                      placeholder="Edit the transcript…"
+                      className="min-h-[20rem] rounded-xl border border-white/10 bg-black/30 p-4"
+                      textClassName="custom-scrollbar overflow-y-auto leading-relaxed text-slate-300"
+                    />
+                  ) : hasCorrected ? (
+                    <div className="selectable-text min-w-0 leading-relaxed wrap-break-word whitespace-pre-wrap text-slate-300">
+                      {correctedTranscript}
+                    </div>
+                  ) : segments.length > 0 ? (
                     hasSegmentDetail ? (
                       segments.map((seg, i) => (
                         <div
@@ -1673,7 +2413,27 @@ export const AudioNoteModal: React.FC<AudioNoteModalProps> = ({
                                 <div
                                   className={`mb-1 text-xs font-bold ${speakerColor(seg.speaker)}`}
                                 >
-                                  {seg.speaker}
+                                  {/* Issue #104 Stories 4.3 / 4.4 — alias-aware
+                                      speaker rendering. The display label is
+                                      `aliasMap[raw] ?? "Speaker N"`; rename
+                                      writes through useRecordingAliases. */}
+                                  <SpeakerRenameInput
+                                    speakerId={seg.speaker}
+                                    currentLabel={labelFor(seg.speaker, speakerLabelMap)}
+                                    className="cursor-text rounded px-1 hover:bg-white/10 focus:bg-white/10 focus:outline-none data-[editing]:bg-black/30"
+                                    onCommit={(newName) =>
+                                      handleSpeakerRename(seg.speaker as string, newName)
+                                    }
+                                  />
+                                  {/* Issue #104 Story 5.5 — per-turn confidence
+                                      chip. high → null; medium → neutral;
+                                      low → amber. Tooltip shows %.  */}
+                                  {(() => {
+                                    const conf = confidenceState.byTurn.get(i);
+                                    return conf !== undefined ? (
+                                      <ConfidenceChip confidence={conf} />
+                                    ) : null;
+                                  })()}
                                 </div>
                               )}
                               {!hideTimestamps && (

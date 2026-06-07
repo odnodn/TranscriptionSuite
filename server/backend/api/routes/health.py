@@ -71,6 +71,9 @@ async def get_status(request: Request) -> dict[str, Any]:
     The ``ready`` field consolidates the logic from ``/ready`` so that
     dashboard clients can poll a single endpoint instead of three.
     """
+    # None (not False) when the model manager is absent, so the field is omitted
+    # rather than reported as a definitive "no GPU".
+    gpu_available: bool | None = None
     try:
         model_manager = request.app.state.model_manager
         status = model_manager.get_status()
@@ -78,6 +81,7 @@ async def get_status(request: Request) -> dict[str, Any]:
         is_loaded = bool(transcription_status.get("loaded", False))
         main_model_disabled = bool(transcription_status.get("disabled", False))
         is_ready = is_loaded or main_model_disabled
+        gpu_available = bool(getattr(model_manager, "gpu_available", False))
     except AttributeError:
         status = {"error": "Model manager not initialized"}
         is_ready = False
@@ -90,9 +94,24 @@ async def get_status(request: Request) -> dict[str, Any]:
         "ready": is_ready or is_live_mode_active(),
     }
 
+    # Surface the container's *actual* GPU availability (CUDA usable inside this
+    # container), not the host's. The dashboard's host-side preflight can report
+    # "CUDA operational" while the container was started without GPU passthrough
+    # (e.g. under the wrong compose overlay) and silently runs on CPU. Exposing
+    # this lets the dashboard warn on that mismatch. Additive + backward compatible.
+    if gpu_available is not None:
+        response["gpu_available"] = gpu_available
+
     gpu_error = getattr(request.app.state, "gpu_error", None)
     if gpu_error is not None:
         response["gpu_error"] = gpu_error.get("error", "Unknown GPU error")
         response["gpu_error_action"] = "Please restart your computer to reset the GPU driver."
+        # Surface the diagnostic recovery_hint (added by Task 4) so the
+        # dashboard's GpuHealthCard can display it verbatim in the red state.
+        # Optional — only present for the error-999 unrecoverable fingerprint;
+        # absent for other failure modes. Backward compatible (additive only).
+        recovery_hint = gpu_error.get("recovery_hint")
+        if recovery_hint:
+            response["gpu_error_recovery_hint"] = recovery_hint
 
     return response

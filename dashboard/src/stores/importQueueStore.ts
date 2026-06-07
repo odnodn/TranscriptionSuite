@@ -16,7 +16,10 @@ import type {
   UploadResponse,
 } from '../api/types';
 import { resolveTranscriptionOutput } from '../services/transcriptionFormatters';
+import { supportsAutoDetect } from '../services/modelCapabilities';
 import { getConfig } from '../config/store';
+import { useDedupChoiceStore } from './dedupChoiceStore';
+import { useAriaAnnouncerStore } from './ariaAnnouncerStore';
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -44,6 +47,31 @@ export interface SessionConfig {
   outputDir: string;
   diarizedFormat: 'srt' | 'ass';
   hideTimestamps: boolean;
+  /** Toggles bridged from SessionImportTab so Folder Watch jobs honor them (Issue #93) */
+  enableDiarization: boolean;
+  enableWordTimestamps: boolean;
+  parallelDiarization: boolean;
+  multitrack: boolean;
+  /** Source-language display name (e.g. "Spanish", "Auto Detect") bridged from
+   *  SessionImportTab so Folder Watch jobs honor the user's picker (gh-102 #3) */
+  language?: string;
+}
+
+export interface NotebookConfig {
+  /** Toggles bridged from NotebookView import tab so Folder Watch jobs honor them (Issue #93) */
+  enableDiarization: boolean;
+  enableWordTimestamps: boolean;
+  parallelDiarization: boolean;
+  /** Source-language display name bridged from NotebookView ImportTab (gh-102 #3) */
+  language?: string;
+}
+
+export interface LanguagesCacheState {
+  /** Active main transcriber model from the most recent useLanguages() push. */
+  model: string | null;
+  languages: Array<{ code: string; name: string }>;
+  /** True until useLanguages() resolves real server data the first time. */
+  loading: boolean;
 }
 
 export interface NotebookCallbacks {
@@ -78,7 +106,11 @@ interface ImportQueueState extends WatcherState {
   jobs: UnifiedImportJob[];
   isPaused: boolean;
   sessionConfig: SessionConfig;
+  notebookConfig: NotebookConfig;
   notebookCallbacks: NotebookCallbacks;
+  /** Languages cache pushed by useLanguages() consumers so handleFilesDetected
+   *  can resolve a display name → code without calling a hook (gh-102 #3) */
+  languagesCache: LanguagesCacheState;
 
   // Actions
   addFiles: (
@@ -101,7 +133,11 @@ interface ImportQueueState extends WatcherState {
   clearFinished: () => void;
   clearAll: () => void;
   updateSessionConfig: (patch: Partial<SessionConfig>) => void;
+  updateNotebookConfig: (patch: Partial<NotebookConfig>) => void;
   updateNotebookCallbacks: (callbacks: NotebookCallbacks) => void;
+  /** gh-102 #3 — pushed by useLanguages() consumers in SessionImportTab and
+   *  NotebookView ImportTab so non-React store actions can resolve language. */
+  setLanguagesCache: (cache: LanguagesCacheState) => void;
 
   // Watcher actions
   setSessionWatchPath: (path: string) => void;
@@ -257,7 +293,41 @@ async function processSessionJob(
     fileObj = file;
   }
 
-  const { job_id: serverJobId } = await apiClient.importAndTranscribe(fileObj, job.options);
+  const importResponse = await apiClient.importAndTranscribe(fileObj, job.options);
+  const { job_id: serverJobId } = importResponse;
+
+  // Issue #104, Story 2.4 + Sprint 2 Item 4 — full DedupPromptModal flow.
+  // When the server reports prior matches, await the user's choice via
+  // useDedupChoiceStore. The container component (mounted at App level)
+  // renders the modal and resolves the promise.
+  if (importResponse.dedup_matches?.length) {
+    const first = importResponse.dedup_matches[0];
+    const choice = await useDedupChoiceStore.getState().requestChoice(importResponse.dedup_matches);
+
+    if (choice === 'use_existing' || choice === 'cancel') {
+      // User picked "Use existing" (or pressed Esc / closed): cancel the
+      // server-side job and skip this queue entry. The cancel API is
+      // best-effort — if the job already completed it's a harmless no-op.
+      try {
+        await apiClient.cancelTranscription();
+      } catch {
+        // Swallow: skip-the-local-entry is the user-visible contract.
+      }
+      useAriaAnnouncerStore.getState().announce(`Duplicate skipped: ${first.name}`, 'polite');
+      // Mark this queue entry as success-with-no-output so the user sees
+      // the queue advance rather than freeze on a "processing" state.
+      // We deliberately do NOT mark as 'error' — the user chose this.
+      store.setState((s) => ({
+        jobs: s.jobs.map((j) =>
+          j.id === job.id ? { ...j, status: 'success' as const, outputFilename: undefined } : j,
+        ),
+      }));
+      return;
+    }
+    // 'create_new': continue with the existing happy path.
+    toast.warning(`Duplicate of '${first.name}' detected. Creating a new entry as requested.`);
+  }
+
   const result = await pollForSessionResult(serverJobId);
 
   if (result.error) throw new Error(result.error);
@@ -410,7 +480,20 @@ export const useImportQueueStore = create<ImportQueueState>()((set) => ({
   // State
   jobs: [],
   isPaused: false,
-  sessionConfig: { outputDir: '', diarizedFormat: 'srt', hideTimestamps: false },
+  sessionConfig: {
+    outputDir: '',
+    diarizedFormat: 'srt',
+    hideTimestamps: false,
+    enableDiarization: true,
+    enableWordTimestamps: true,
+    parallelDiarization: false,
+    multitrack: false,
+  },
+  notebookConfig: {
+    enableDiarization: true,
+    enableWordTimestamps: true,
+    parallelDiarization: false,
+  },
   notebookCallbacks: {},
 
   // Watcher state
@@ -421,6 +504,15 @@ export const useImportQueueStore = create<ImportQueueState>()((set) => ({
   watcherServerConnected: true,
   watchLog: [],
   avgProcessingMs: 0,
+
+  // gh-102 #3 — initial cache is "loading" with empty list. Populated by
+  // useLanguages() consumers (SessionImportTab, NotebookView ImportTab) via
+  // setLanguagesCache. Folder Watch pauses while loading or pre-populated.
+  languagesCache: {
+    model: null,
+    languages: [],
+    loading: true,
+  },
 
   // ─── Queue Actions ───────────────────────────────────────────────────────
 
@@ -501,8 +593,16 @@ export const useImportQueueStore = create<ImportQueueState>()((set) => ({
     set((s) => ({ sessionConfig: { ...s.sessionConfig, ...patch } }));
   },
 
+  updateNotebookConfig: (patch) => {
+    set((s) => ({ notebookConfig: { ...s.notebookConfig, ...patch } }));
+  },
+
   updateNotebookCallbacks: (callbacks) => {
     set({ notebookCallbacks: callbacks });
+  },
+
+  setLanguagesCache: (cache) => {
+    set({ languagesCache: cache });
   },
 
   // ─── Watcher Actions ──────────────────────────────────────────────────────
@@ -542,16 +642,70 @@ export const useImportQueueStore = create<ImportQueueState>()((set) => ({
       return;
     }
 
+    // Source toggle state from per-tab configs so auto-watch jobs honor the
+    // user's UI selections. Mirrors the manual-import derivation in
+    // SessionImportTab.handleFiles / NotebookImportTab.handleFiles (Issue #93).
+    const state = useImportQueueStore.getState();
+
+    // gh-102 #3 — resolve persisted Source Language display name → code via
+    // the languages cache. Pause the entire detection batch when languages
+    // haven't loaded yet, OR when the active model lacks auto-detect (Canary,
+    // MLX-Canary) and the resolve fails. Reuses the folder-watch warn-toast +
+    // appendWatchLog channel established by the watcherServerConnected guard.
+    const cfg = type === 'session' ? state.sessionConfig : state.notebookConfig;
+    const cache = state.languagesCache;
+
+    // Pause when the cache is unpopulated. `cache.model === null` covers both
+    // the initial state and any window before a useLanguages() consumer has
+    // pushed real data. Using model-identity (not languages.length) avoids a
+    // false "loaded-but-empty" misclassification: empty list with loading=false
+    // would be a server contract violation, not a loading state, and should
+    // fall through to the explicit-required guard below where Canary still
+    // pauses (correct behavior) and Whisper proceeds with auto-detect.
+    if (cache.loading || cache.model === null) {
+      const msg = 'Folder Watch paused — languages still loading';
+      toast.warning(msg);
+      useImportQueueStore.getState().appendWatchLog({ message: msg, level: 'warn' });
+      return;
+    }
+
+    const requestedDisplayName = cfg.language;
+    const isAutoDetect = !requestedDisplayName || requestedDisplayName === 'Auto Detect';
+    const resolvedCode = isAutoDetect
+      ? undefined
+      : cache.languages.find((l) => l.name === requestedDisplayName)?.code;
+    const requiresExplicit = cache.model !== null && !supportsAutoDetect(cache.model);
+
+    if (requiresExplicit && resolvedCode === undefined) {
+      const msg = 'Folder Watch paused — Source Language required for the active model';
+      toast.warning(msg);
+      useImportQueueStore.getState().appendWatchLog({ message: msg, level: 'warn' });
+      return;
+    }
+
     if (type === 'notebook') {
+      const { enableDiarization, enableWordTimestamps, parallelDiarization } = state.notebookConfig;
       // Add each notebook file individually so we can attach its creation timestamp.
       // This ensures the entry lands on the correct calendar date.
       for (const meta of fileMeta) {
-        useImportQueueStore.getState().addFiles([meta.path], 'notebook-auto', {
+        state.addFiles([meta.path], 'notebook-auto', {
           file_created_at: meta.createdAt,
+          enable_diarization: enableDiarization,
+          enable_word_timestamps: enableWordTimestamps,
+          parallel_diarization: enableDiarization ? parallelDiarization : undefined,
+          language: resolvedCode,
         });
       }
     } else {
-      useImportQueueStore.getState().addFiles(files, 'session-auto');
+      const { enableDiarization, enableWordTimestamps, parallelDiarization, multitrack } =
+        state.sessionConfig;
+      state.addFiles(files, 'session-auto', {
+        enable_diarization: multitrack ? false : enableDiarization,
+        enable_word_timestamps: enableWordTimestamps,
+        parallel_diarization: enableDiarization && !multitrack ? parallelDiarization : undefined,
+        multitrack: multitrack || undefined,
+        language: resolvedCode,
+      });
     }
 
     toast.success(`${files.length} file${files.length === 1 ? '' : 's'} auto-queued from ${label}`);

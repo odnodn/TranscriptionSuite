@@ -124,6 +124,54 @@ describe('[P1] composeFileArgs', () => {
     ]);
   });
 
+  // ── GH-101 follow-up: Vulkan-WSL2 compose selection ─────────────────────
+
+  it('Win32 + Vulkan-WSL2: base + desktop-vm only — containerised Vulkan sidecar is retired', () => {
+    setPlatform('win32');
+    const args = composeFileArgs('vulkan-wsl2', 'docker', null);
+    const files = extractFiles(args);
+
+    // The vulkan-wsl2 container sidecar (docker-compose.vulkan-wsl2.yml) was
+    // retired in 49cd8ab: whisper-server.exe now runs natively on the Windows
+    // host (the containerised whisper-server cannot start without AVX2) and
+    // Docker reaches it via host.docker.internal:8080. Compose selection adds
+    // no Vulkan overlay — only the base service + desktop-vm networking.
+    expect(files).toEqual(['docker-compose.yml', 'docker-compose.desktop-vm.yml']);
+  });
+
+  it('Vulkan-WSL2 attaches no container Vulkan overlay (neither WSL2 nor Linux-DRI)', () => {
+    setPlatform('win32');
+    const files = extractFiles(composeFileArgs('vulkan-wsl2', 'docker', null));
+
+    // Native whisper-server.exe path — no containerised Vulkan sidecar at all,
+    // and it must never pull in the Linux-DRI overlay either.
+    expect(files).not.toContain('docker-compose.vulkan-wsl2.yml');
+    expect(files).not.toContain('docker-compose.vulkan.yml');
+  });
+
+  it('Vulkan (Linux-DRI) selects the Linux overlay (NOT the WSL2 overlay)', () => {
+    setPlatform('linux');
+    const files = extractFiles(composeFileArgs('vulkan', 'docker', null));
+
+    expect(files).toContain('docker-compose.vulkan.yml');
+    expect(files).not.toContain('docker-compose.vulkan-wsl2.yml');
+  });
+
+  it('Vulkan-WSL2 on Linux: defense-in-depth — overlay is NOT attached even if profile leaks', () => {
+    setPlatform('linux');
+    const files = extractFiles(composeFileArgs('vulkan-wsl2', 'docker', null));
+
+    expect(files).not.toContain('docker-compose.vulkan-wsl2.yml');
+    expect(files).not.toContain('docker-compose.vulkan.yml');
+  });
+
+  it('Vulkan-WSL2 on macOS: defense-in-depth — overlay is NOT attached even if profile leaks', () => {
+    setPlatform('darwin');
+    const files = extractFiles(composeFileArgs('vulkan-wsl2', 'docker', null));
+
+    expect(files).not.toContain('docker-compose.vulkan-wsl2.yml');
+  });
+
   // ── Output format tests ─────────────────────────────────────────────────
 
   it('returns flat [-f, file] pairs', () => {

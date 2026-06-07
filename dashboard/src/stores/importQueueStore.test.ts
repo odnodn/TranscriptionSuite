@@ -21,12 +21,24 @@ vi.mock('../services/transcriptionFormatters', () => ({
   })),
 }));
 
+// Mock sonner so the new gh-102 #3 tests can assert on toast.warning calls
+// without rendering. Existing tests don't assert on toast and stay unaffected.
+vi.mock('sonner', () => ({
+  toast: {
+    warning: vi.fn(),
+    success: vi.fn(),
+    error: vi.fn(),
+    info: vi.fn(),
+  },
+}));
+
 // Stub window.electronAPI
 Object.defineProperty(globalThis, 'window', {
   value: globalThis,
   writable: true,
 });
 
+import { toast } from 'sonner';
 import {
   useImportQueueStore,
   selectPendingCount,
@@ -43,12 +55,40 @@ function resetStore() {
   useImportQueueStore.setState({
     jobs: [],
     isPaused: false,
-    sessionConfig: { outputDir: '', diarizedFormat: 'srt', hideTimestamps: false },
+    sessionConfig: {
+      outputDir: '',
+      diarizedFormat: 'srt',
+      hideTimestamps: false,
+      enableDiarization: true,
+      enableWordTimestamps: true,
+      parallelDiarization: false,
+      multitrack: false,
+    },
+    notebookConfig: {
+      enableDiarization: true,
+      enableWordTimestamps: true,
+      parallelDiarization: false,
+    },
     notebookCallbacks: {},
     sessionWatchPath: '',
     sessionWatchActive: false,
     notebookWatchPath: '',
     notebookWatchActive: false,
+    watcherServerConnected: true,
+    watchLog: [],
+    avgProcessingMs: 0,
+    // gh-102 #3 — default to a "ready" cache with a Whisper model so the
+    // language-resolution branch in handleFilesDetected falls through (no
+    // pause, no explicit-required) and pre-existing tests stay green. Tests
+    // that exercise the new behavior override this with setLanguagesCache.
+    languagesCache: {
+      model: 'large-v3',
+      languages: [
+        { code: 'en', name: 'English' },
+        { code: 'es', name: 'Spanish' },
+      ],
+      loading: false,
+    },
   });
 }
 
@@ -70,6 +110,14 @@ describe('importQueueStore', () => {
   beforeEach(() => {
     resetStore();
     vi.useFakeTimers();
+    // Clear sonner mock counts at the suite level so toast assertions never
+    // bleed across describe blocks (e.g. the watcherServerConnected guard
+    // emits toast.warning, which would otherwise contaminate the gh-102 #3
+    // tests' toHaveBeenCalledWith checks).
+    vi.mocked(toast.warning).mockClear();
+    vi.mocked(toast.success).mockClear();
+    vi.mocked(toast.error).mockClear();
+    vi.mocked(toast.info).mockClear();
   });
 
   afterEach(() => {
@@ -263,6 +311,16 @@ describe('importQueueStore', () => {
     });
   });
 
+  // ── updateNotebookConfig ───────────────────────────────────────────────
+
+  describe('updateNotebookConfig', () => {
+    it('merges partial config', () => {
+      getState().updateNotebookConfig({ enableDiarization: false });
+      expect(getState().notebookConfig.enableDiarization).toBe(false);
+      expect(getState().notebookConfig.enableWordTimestamps).toBe(true);
+    });
+  });
+
   // ── updateNotebookCallbacks ────────────────────────────────────────────
 
   describe('updateNotebookCallbacks', () => {
@@ -270,6 +328,351 @@ describe('importQueueStore', () => {
       const onSuccess = vi.fn();
       getState().updateNotebookCallbacks({ onJobSuccess: onSuccess });
       expect(getState().notebookCallbacks.onJobSuccess).toBe(onSuccess);
+    });
+  });
+
+  // ── handleFilesDetected (Issue #93 — Folder Watch toggle propagation) ──
+  //
+  // The auto-watch path (session-auto / notebook-auto) MUST source toggle
+  // state from the per-tab configs so user-facing UI selections actually
+  // reach the backend. Each test asserts on the captured `options` of the
+  // resulting job.
+
+  describe('handleFilesDetected', () => {
+    // Inspecting real addFiles (rather than a spy) is safe under
+    // vi.useFakeTimers — processQueue is scheduled via setTimeout(0) and
+    // never fires synchronously, so the mocked apiClient is unreachable.
+    function lastJobOptions() {
+      const { jobs } = getState();
+      return jobs[jobs.length - 1].options;
+    }
+
+    it('session: passes diarization=true and parallel value when toggle is ON', () => {
+      getState().updateSessionConfig({
+        enableDiarization: true,
+        enableWordTimestamps: true,
+        parallelDiarization: true,
+        multitrack: false,
+      });
+      getState().handleFilesDetected({
+        type: 'session',
+        files: ['/watch/a.wav'],
+        count: 1,
+        fileMeta: [],
+      });
+      expect(lastJobOptions()).toMatchObject({
+        enable_diarization: true,
+        enable_word_timestamps: true,
+        parallel_diarization: true,
+      });
+      expect(lastJobOptions()?.multitrack).toBeUndefined();
+    });
+
+    it('session: multitrack ON forces enable_diarization=false and drops parallel', () => {
+      getState().updateSessionConfig({
+        enableDiarization: true,
+        parallelDiarization: true,
+        multitrack: true,
+      });
+      getState().handleFilesDetected({
+        type: 'session',
+        files: ['/watch/multi.wav'],
+        count: 1,
+        fileMeta: [],
+      });
+      expect(lastJobOptions()).toMatchObject({
+        enable_diarization: false,
+        multitrack: true,
+      });
+      expect(lastJobOptions()?.parallel_diarization).toBeUndefined();
+    });
+
+    it('session: diarization OFF and timestamps OFF flow through', () => {
+      getState().updateSessionConfig({
+        enableDiarization: false,
+        enableWordTimestamps: false,
+        parallelDiarization: false,
+        multitrack: false,
+      });
+      getState().handleFilesDetected({
+        type: 'session',
+        files: ['/watch/plain.wav'],
+        count: 1,
+        fileMeta: [],
+      });
+      expect(lastJobOptions()).toMatchObject({
+        enable_diarization: false,
+        enable_word_timestamps: false,
+      });
+      expect(lastJobOptions()?.parallel_diarization).toBeUndefined();
+      expect(lastJobOptions()?.multitrack).toBeUndefined();
+    });
+
+    it('notebook: passes diarization toggle and preserves file_created_at', () => {
+      getState().updateNotebookConfig({
+        enableDiarization: true,
+        enableWordTimestamps: true,
+        parallelDiarization: true,
+      });
+      getState().handleFilesDetected({
+        type: 'notebook',
+        files: ['/watch/note.wav'],
+        count: 1,
+        fileMeta: [{ path: '/watch/note.wav', createdAt: '2026-04-26T10:00:00Z' }],
+      });
+      expect(lastJobOptions()).toMatchObject({
+        file_created_at: '2026-04-26T10:00:00Z',
+        enable_diarization: true,
+        enable_word_timestamps: true,
+        parallel_diarization: true,
+      });
+    });
+
+    it('notebook: diarization OFF drops parallel_diarization', () => {
+      getState().updateNotebookConfig({
+        enableDiarization: false,
+        parallelDiarization: true,
+      });
+      getState().handleFilesDetected({
+        type: 'notebook',
+        files: ['/watch/note2.wav'],
+        count: 1,
+        fileMeta: [{ path: '/watch/note2.wav', createdAt: '2026-04-26T11:00:00Z' }],
+      });
+      expect(lastJobOptions()?.enable_diarization).toBe(false);
+      expect(lastJobOptions()?.parallel_diarization).toBeUndefined();
+    });
+
+    it('uses defaults when notebook tab has not synced its toggles', () => {
+      getState().handleFilesDetected({
+        type: 'notebook',
+        files: ['/watch/default.wav'],
+        count: 1,
+        fileMeta: [{ path: '/watch/default.wav', createdAt: '2026-04-26T12:00:00Z' }],
+      });
+      expect(lastJobOptions()).toMatchObject({
+        enable_diarization: true,
+        enable_word_timestamps: true,
+      });
+    });
+
+    it('skips when watcherServerConnected is false', () => {
+      useImportQueueStore.setState({ watcherServerConnected: false });
+      getState().handleFilesDetected({
+        type: 'session',
+        files: ['/watch/x.wav'],
+        count: 1,
+        fileMeta: [],
+      });
+      expect(getState().jobs).toHaveLength(0);
+    });
+  });
+
+  // ── handleFilesDetected — gh-102 #3 language resolution ────────────────
+  //
+  // Folder-watch auto-imports must honor the user's persisted Source Language
+  // picker. The handler resolves the snapshotted display name → code via the
+  // languagesCache (populated by useLanguages consumers in SessionImportTab
+  // and NotebookView ImportTab) and pauses the entire detection batch when
+  // languages haven't loaded or the active model lacks auto-detect and the
+  // resolve fails. Each test pre-seeds sessionConfig/notebookConfig and
+  // languagesCache, then asserts on jobs[] (enqueue) or watchLog + toast.warning
+  // (pause).
+
+  describe('handleFilesDetected — gh-102 #3 language resolution', () => {
+    function lastJobOptions() {
+      const { jobs } = getState();
+      return jobs[jobs.length - 1].options;
+    }
+    function lastWatchLogMessage() {
+      const { watchLog } = getState();
+      return watchLog[watchLog.length - 1]?.message;
+    }
+
+    it('session: Canary + Spanish loaded → enqueues with language=es', () => {
+      getState().updateSessionConfig({ language: 'Spanish' });
+      getState().setLanguagesCache({
+        model: 'nvidia/canary-1b-v2',
+        languages: [
+          { code: 'en', name: 'English' },
+          { code: 'es', name: 'Spanish' },
+        ],
+        loading: false,
+      });
+      getState().handleFilesDetected({
+        type: 'session',
+        files: ['/watch/spanish.wav'],
+        count: 1,
+        fileMeta: [],
+      });
+      expect(getState().jobs).toHaveLength(1);
+      expect(lastJobOptions()?.language).toBe('es');
+    });
+
+    it('session: Canary + Auto Detect → pauses, no enqueue, "Source Language required" warn', () => {
+      getState().updateSessionConfig({ language: 'Auto Detect' });
+      getState().setLanguagesCache({
+        model: 'nvidia/canary-1b-v2',
+        languages: [{ code: 'es', name: 'Spanish' }],
+        loading: false,
+      });
+      getState().handleFilesDetected({
+        type: 'session',
+        files: ['/watch/auto.wav'],
+        count: 1,
+        fileMeta: [],
+      });
+      expect(getState().jobs).toHaveLength(0);
+      expect(lastWatchLogMessage()).toBe(
+        'Folder Watch paused — Source Language required for the active model',
+      );
+      expect(toast.warning).toHaveBeenCalledWith(
+        'Folder Watch paused — Source Language required for the active model',
+      );
+    });
+
+    it('session: Canary + Spanish but languages loading → pauses, "languages still loading" warn', () => {
+      getState().updateSessionConfig({ language: 'Spanish' });
+      getState().setLanguagesCache({
+        model: 'nvidia/canary-1b-v2',
+        languages: [],
+        loading: true,
+      });
+      getState().handleFilesDetected({
+        type: 'session',
+        files: ['/watch/early.wav'],
+        count: 1,
+        fileMeta: [],
+      });
+      expect(getState().jobs).toHaveLength(0);
+      expect(lastWatchLogMessage()).toBe('Folder Watch paused — languages still loading');
+      expect(toast.warning).toHaveBeenCalledWith('Folder Watch paused — languages still loading');
+    });
+
+    it('session: Whisper + Auto Detect → enqueues with language=undefined (auto-detect)', () => {
+      getState().updateSessionConfig({ language: 'Auto Detect' });
+      getState().setLanguagesCache({
+        model: 'large-v3',
+        languages: [{ code: 'es', name: 'Spanish' }],
+        loading: false,
+      });
+      getState().handleFilesDetected({
+        type: 'session',
+        files: ['/watch/whisper-auto.wav'],
+        count: 1,
+        fileMeta: [],
+      });
+      expect(getState().jobs).toHaveLength(1);
+      expect(lastJobOptions()?.language).toBeUndefined();
+    });
+
+    it('session: Whisper + Spanish → enqueues with language=es', () => {
+      getState().updateSessionConfig({ language: 'Spanish' });
+      getState().setLanguagesCache({
+        model: 'large-v3',
+        languages: [{ code: 'es', name: 'Spanish' }],
+        loading: false,
+      });
+      getState().handleFilesDetected({
+        type: 'session',
+        files: ['/watch/whisper-es.wav'],
+        count: 1,
+        fileMeta: [],
+      });
+      expect(getState().jobs).toHaveLength(1);
+      expect(lastJobOptions()?.language).toBe('es');
+    });
+
+    it('notebook: Canary + Spanish loaded → enqueues with language=es', () => {
+      getState().updateNotebookConfig({ language: 'Spanish' });
+      getState().setLanguagesCache({
+        model: 'nvidia/canary-1b-v2',
+        languages: [{ code: 'es', name: 'Spanish' }],
+        loading: false,
+      });
+      getState().handleFilesDetected({
+        type: 'notebook',
+        files: ['/watch/notebook-es.wav'],
+        count: 1,
+        fileMeta: [{ path: '/watch/notebook-es.wav', createdAt: '2026-04-30T10:00:00Z' }],
+      });
+      expect(getState().jobs).toHaveLength(1);
+      expect(lastJobOptions()?.language).toBe('es');
+      expect(lastJobOptions()?.file_created_at).toBe('2026-04-30T10:00:00Z');
+    });
+
+    it('notebook: Canary + Auto Detect → pauses, no enqueue, "Source Language required" warn', () => {
+      getState().updateNotebookConfig({ language: 'Auto Detect' });
+      getState().setLanguagesCache({
+        model: 'nvidia/canary-1b-v2',
+        languages: [{ code: 'es', name: 'Spanish' }],
+        loading: false,
+      });
+      getState().handleFilesDetected({
+        type: 'notebook',
+        files: ['/watch/notebook-auto.wav'],
+        count: 1,
+        fileMeta: [{ path: '/watch/notebook-auto.wav', createdAt: '2026-04-30T11:00:00Z' }],
+      });
+      expect(getState().jobs).toHaveLength(0);
+      expect(lastWatchLogMessage()).toBe(
+        'Folder Watch paused — Source Language required for the active model',
+      );
+      expect(toast.warning).toHaveBeenCalledWith(
+        'Folder Watch paused — Source Language required for the active model',
+      );
+    });
+
+    it('notebook: Canary + Spanish but languages loading → pauses, "languages still loading" warn', () => {
+      getState().updateNotebookConfig({ language: 'Spanish' });
+      getState().setLanguagesCache({
+        model: 'nvidia/canary-1b-v2',
+        languages: [],
+        loading: true,
+      });
+      getState().handleFilesDetected({
+        type: 'notebook',
+        files: ['/watch/notebook-early.wav'],
+        count: 1,
+        fileMeta: [{ path: '/watch/notebook-early.wav', createdAt: '2026-04-30T12:00:00Z' }],
+      });
+      expect(getState().jobs).toHaveLength(0);
+      expect(lastWatchLogMessage()).toBe('Folder Watch paused — languages still loading');
+      expect(toast.warning).toHaveBeenCalledWith('Folder Watch paused — languages still loading');
+    });
+
+    it('notebook: Whisper + Auto Detect → enqueues with language=undefined (auto-detect)', () => {
+      getState().updateNotebookConfig({ language: 'Auto Detect' });
+      getState().setLanguagesCache({
+        model: 'large-v3',
+        languages: [{ code: 'es', name: 'Spanish' }],
+        loading: false,
+      });
+      getState().handleFilesDetected({
+        type: 'notebook',
+        files: ['/watch/notebook-whisper-auto.wav'],
+        count: 1,
+        fileMeta: [{ path: '/watch/notebook-whisper-auto.wav', createdAt: '2026-04-30T13:00:00Z' }],
+      });
+      expect(getState().jobs).toHaveLength(1);
+      expect(lastJobOptions()?.language).toBeUndefined();
+    });
+
+    it('notebook: Whisper + Spanish → enqueues with language=es', () => {
+      getState().updateNotebookConfig({ language: 'Spanish' });
+      getState().setLanguagesCache({
+        model: 'large-v3',
+        languages: [{ code: 'es', name: 'Spanish' }],
+        loading: false,
+      });
+      getState().handleFilesDetected({
+        type: 'notebook',
+        files: ['/watch/notebook-whisper-es.wav'],
+        count: 1,
+        fileMeta: [{ path: '/watch/notebook-whisper-es.wav', createdAt: '2026-04-30T14:00:00Z' }],
+      });
+      expect(getState().jobs).toHaveLength(1);
+      expect(lastJobOptions()?.language).toBe('es');
     });
   });
 

@@ -30,6 +30,8 @@ import { AudioVisualizer } from '../AudioVisualizer';
 import { CustomSelect } from '../ui/CustomSelect';
 import { FullscreenVisualizer } from './FullscreenVisualizer';
 import { PopOutWindow } from '../PopOutWindow';
+import { FindReplaceTextEditor } from '../editor/FindReplaceTextEditor';
+import { LiveTranscriptView } from './LiveTranscriptView';
 import { useQueryClient } from '@tanstack/react-query';
 import { useLanguages } from '../../src/hooks/useLanguages';
 import { writeToClipboard } from '../../src/hooks/useClipboard';
@@ -47,7 +49,9 @@ import {
   filterLanguagesForModel,
   isCanaryModel,
   isWhisperModel,
+  isWhisperCppModel,
   pickDefaultLanguage,
+  supportsAutoDetect,
   CANARY_TRANSLATION_TARGETS,
 } from '../../src/services/modelCapabilities';
 import { isModelDisabled } from '../../src/services/modelSelection';
@@ -163,6 +167,13 @@ export const SessionView: React.FC<SessionViewProps> = ({
 
   // Active analyser: live mode takes priority when active, then one-shot
   const activeAnalyser = live.analyser ?? transcription.analyser;
+
+  // Session main-result editing (client-only): hand-corrections flow into
+  // Copy/Download. Reset whenever a new transcription replaces the text.
+  const [editedResultText, setEditedResultText] = useState('');
+  useEffect(() => {
+    setEditedResultText(transcription.result?.text ?? '');
+  }, [transcription.result?.text]);
 
   // Audio device enumeration
   const [micDevices, setMicDevices] = useState<string[]>([]);
@@ -312,18 +323,64 @@ export const SessionView: React.FC<SessionViewProps> = ({
   const canTranslateLive = supportsTranslation(activeLiveModel);
   const mainModelDisabled = isModelDisabled(activeModel);
   const liveModelDisabled = isModelDisabled(activeLiveModel);
-  const liveModeWhisperOnlyCompatible = !liveModelDisabled && isWhisperModel(activeLiveModel);
+  const liveModeWhisperOnlyCompatible =
+    !liveModelDisabled && (isWhisperModel(activeLiveModel) || isWhisperCppModel(activeLiveModel));
   const liveModeUnsupportedMessage = activeLiveModel
-    ? `Live Mode is not compatible with "${activeLiveModel}" — only faster-whisper models are supported in v1. Set a faster-whisper model as the Live Mode model in Server settings.`
-    : 'Live Mode only supports faster-whisper models in v1. Change the Live Mode model in Server settings.';
+    ? `Live Mode is not compatible with "${activeLiveModel}" — only faster-whisper and whisper.cpp (GGML) models are supported. Set a supported model as the Live Mode model in Server settings.`
+    : 'Live Mode only supports faster-whisper and whisper.cpp (GGML) models. Change the Live Mode model in Server settings.';
   const liveModeDisabledReason = (() => {
     if (!clientRunning) return 'Server is not running';
     if (!serverConnection.ready) return 'Server is not ready';
     if (liveModelDisabled) return 'No live model selected — configure one in Server settings';
     if (!liveModeWhisperOnlyCompatible)
-      return `"${activeLiveModel}" is not a faster-whisper model — Live Mode requires a faster-whisper model`;
+      return `"${activeLiveModel}" is not a supported Live Mode backend — use a faster-whisper or whisper.cpp (GGML) model`;
     return '';
   })();
+  // gh-86 #1 follow-up — `isLive` is referenced both by the IIFE below and the
+  // Start Recording disabled-prop further down; hoisted here so a single
+  // predicate definition feeds both, instead of duplicating the live-status
+  // check inline. Originally declared in the "Live Mode State" block below.
+  const isLive = live.status !== 'idle' && live.status !== 'error';
+  // Issue #86 #1 (+ follow-up) — surface the reason the Start Recording button
+  // is gated. The disabled-prop covers four conditions; this IIFE surfaces an
+  // inline amber warning for three of them (`mainModelDisabled` keeps its own
+  // warning rendered next to the model dropdown). Server-state gates win
+  // priority because they are the root cause when both fire — no amount of
+  // stopping Live Mode recovers a dead server. The `isLive` branch closes the
+  // gh-86 #1 follow-up: `isLive && canStartRecording === true` is the normal
+  // state any time the user starts Live Mode while main transcription is idle,
+  // because the two state machines are independent.
+  const recordingDisabledReason = (() => {
+    if (!clientRunning) return 'Server is not running — start it from the Server view.';
+    if (!serverConnection.ready)
+      return 'Server is starting or model is loading — check the Server view for progress.';
+    if (isLive) return 'Live Mode is active — stop Live Mode to start recording.';
+    return '';
+  })();
+
+  // Live-mode editing (client-only): editable only after capture stops. Seeded
+  // from the captured transcript via live.getText(); reset when a new session
+  // starts. Drives the Live Copy button. Nothing is persisted (design D2).
+  const [editedLiveText, setEditedLiveText] = useState('');
+  const liveEditDirtyRef = useRef(false);
+  useEffect(() => {
+    if (isLive) {
+      liveEditDirtyRef.current = false;
+      setEditedLiveText('');
+    } else if (!liveEditDirtyRef.current) {
+      setEditedLiveText(live.getText());
+    }
+  }, [isLive, live]);
+  const handleEditedLiveChange = useCallback((next: string) => {
+    liveEditDirtyRef.current = true;
+    setEditedLiveText(next);
+  }, []);
+  const handleLiveCopyAndClear = useCallback(() => {
+    writeToClipboard(editedLiveText || live.getText()).catch(() => {});
+    live.clearHistory();
+    liveEditDirtyRef.current = false;
+    setEditedLiveText('');
+  }, [editedLiveText, live]);
 
   // Filter language options per model — Parakeet models only support 25 languages
   const mainLanguageOptions = useMemo(
@@ -337,19 +394,33 @@ export const SessionView: React.FC<SessionViewProps> = ({
 
   // Main Transcription State
   const [mainLanguage, setMainLanguage] = useState('Auto Detect');
-  const [mainTranslate, setMainTranslate] = useState(false);
+  const [mainTranslate, setMainTranslateRaw] = useState(false);
   // Bidirectional translation target (used when Canary + source=English)
-  const [mainBidiTarget, setMainBidiTarget] = useState('Off');
+  const [mainBidiTarget, setMainBidiTargetRaw] = useState('Off');
 
   // Output formatting
   const [hideTimestamps, setHideTimestamps] = useState(false);
 
-  // Live Mode State
-  const isLive = live.status !== 'idle' && live.status !== 'error';
+  // Live Mode State (`isLive` hoisted above for use by recordingDisabledReason)
   const [liveLanguage, setLiveLanguage] = useState('English');
   const [liveTranslate, setLiveTranslate] = useState(false);
   // Bidirectional translation target (used when Canary + source=English)
   const [liveBidiTarget, setLiveBidiTarget] = useState('Off');
+
+  // gh-102 followup: persist mainTranslate / mainBidiTarget so the file-import
+  // surface (SessionImportTab) can read the same source-of-truth as the
+  // live-recording leg. Without persistence the import POST would never see
+  // the translation parity that handleStartRecording produces from in-memory
+  // state.
+  const setMainTranslate = useCallback((value: boolean) => {
+    setMainTranslateRaw(value);
+    void setConfig('session.mainTranslate', value).catch(() => {});
+  }, []);
+
+  const setMainBidiTarget = useCallback((value: string) => {
+    setMainBidiTargetRaw(value);
+    void setConfig('session.mainBidiTarget', value).catch(() => {});
+  }, []);
 
   // Canary bidirectional mode: when Canary model + source=English, show target dropdown
   const isCanaryMainBidi = isCanaryModel(activeModel) && mainLanguage === 'English';
@@ -365,6 +436,8 @@ export const SessionView: React.FC<SessionViewProps> = ({
         savedMainLanguage,
         savedLiveLanguage,
         savedHideTimestamps,
+        savedMainTranslate,
+        savedMainBidiTarget,
       ] = await Promise.all([
         getConfig<'mic' | 'system'>('session.audioSource'),
         getConfig<string>('session.micDevice'),
@@ -372,6 +445,8 @@ export const SessionView: React.FC<SessionViewProps> = ({
         getConfig<string>('session.mainLanguage'),
         getConfig<string>('session.liveLanguage'),
         getConfig<boolean>('output.hideTimestamps'),
+        getConfig<boolean>('session.mainTranslate'),
+        getConfig<string>('session.mainBidiTarget'),
       ]);
       if (!active) return;
 
@@ -396,6 +471,13 @@ export const SessionView: React.FC<SessionViewProps> = ({
         setLiveLanguage(savedLiveLanguage);
       }
       if (savedHideTimestamps != null) setHideTimestamps(savedHideTimestamps);
+      // gh-102 followup: rehydrate translate/bidi state so the file-import
+      // surface and the live-recording surface always see the same selection
+      // after reload. Use the raw setters here to avoid re-persisting on hydrate.
+      if (typeof savedMainTranslate === 'boolean') setMainTranslateRaw(savedMainTranslate);
+      if (typeof savedMainBidiTarget === 'string' && savedMainBidiTarget) {
+        setMainBidiTargetRaw(savedMainBidiTarget);
+      }
     })().catch(() => {});
 
     return () => {
@@ -462,9 +544,12 @@ export const SessionView: React.FC<SessionViewProps> = ({
     void setConfig('session.liveLanguage', language).catch(() => {});
   }, []);
 
-  // Reset translate toggles when model changes to one that doesn't support it
+  // Reset translate toggles when model changes to one that does not support it.
+  // Uses the raw setter so a model-driven reset stays in-memory only — calling
+  // the persisting wrapper here would clobber the user-saved preference on
+  // every swap through a non-translation backend (Parakeet, Whisper turbo, …).
   useEffect(() => {
-    if (!canTranslate) setMainTranslate(false);
+    if (!canTranslate) setMainTranslateRaw(false);
   }, [canTranslate]);
 
   useEffect(() => {
@@ -629,12 +714,12 @@ export const SessionView: React.FC<SessionViewProps> = ({
     modelsLoaded: isAsrModelsLoaded,
     isLocalConnection: !isRemoteMode,
     isUploading,
-    onStartRecording: () => transcription.start(),
+    onStartRecording: () => handleStartRecording(),
     onStopRecording: () => {
       if (isLive) live.stop();
-      else transcription.stop();
+      else handleStopRecording();
     },
-    onCancelRecording: () => transcription.reset(),
+    onCancelRecording: () => handleCancelProcessing(),
     onToggleMute: () => {
       if (transcription.status === 'recording' || transcription.status === 'connecting') {
         transcription.toggleMute();
@@ -676,6 +761,22 @@ export const SessionView: React.FC<SessionViewProps> = ({
 
   const handleStartRecording = useCallback(() => {
     if (!canStartRecording || mainModelDisabled) return;
+    // gh-102: refuse to start when the active model requires an explicit
+    // source language but the dashboard cannot resolve one. Without this,
+    // the WS `start` frame would omit `language` and the Canary backend
+    // would surface the cryptic "received None" toast (gh-81 fail-loud
+    // guard). Block here with a clear message instead.
+    const resolvedLang = resolveLanguage(mainLanguage);
+    if (resolvedLang === undefined && !supportsAutoDetect(activeModel)) {
+      toast.error('Source language required', {
+        description: languagesLoading
+          ? 'Loading languages — please try again in a moment.'
+          : mainLanguage
+            ? `"${mainLanguage}" is not a valid source language for the active model. Pick a language from the Source Language dropdown.`
+            : 'No source language is selected. Pick a language from the Source Language dropdown.',
+      });
+      return;
+    }
     transcription.reset();
     const isSystemAudio = audioSource === 'system';
     const mainTranslateActive = isCanaryMainBidi ? mainBidiTarget !== 'Off' : mainTranslate;
@@ -698,7 +799,7 @@ export const SessionView: React.FC<SessionViewProps> = ({
         }
       }
       transcription.start({
-        language: resolveLanguage(mainLanguage),
+        language: resolvedLang,
         deviceId: isSystemAudio ? undefined : micDeviceIds[micDevice],
         translate: mainTranslateActive,
         translationTarget: mainTranslateTarget,
@@ -726,6 +827,8 @@ export const SessionView: React.FC<SessionViewProps> = ({
     sysDevice,
     sinkNameMap,
     captureGain,
+    activeModel,
+    languagesLoading,
   ]);
 
   const handleStopRecording = useCallback(() => {
@@ -760,16 +863,18 @@ export const SessionView: React.FC<SessionViewProps> = ({
     }
   }, [transcription, isLinux]);
 
-  // Copy transcription result to clipboard
+  // Copy transcription result to clipboard (prefers the edited text)
   const handleCopyTranscription = useCallback(() => {
-    if (!transcription.result?.text) return;
-    writeToClipboard(transcription.result.text).catch(() => {});
-  }, [transcription.result?.text]);
+    const text = editedResultText ?? transcription.result?.text;
+    if (!text) return;
+    writeToClipboard(text).catch(() => {});
+  }, [editedResultText, transcription.result?.text]);
 
-  // Download transcription as TXT file
+  // Download transcription as TXT file (prefers the edited text)
   const handleDownloadTranscription = useCallback(() => {
-    if (!transcription.result?.text) return;
-    const blob = new Blob([transcription.result.text], { type: 'text/plain' });
+    const text = editedResultText ?? transcription.result?.text;
+    if (!text) return;
+    const blob = new Blob([text], { type: 'text/plain' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
@@ -783,6 +888,23 @@ export const SessionView: React.FC<SessionViewProps> = ({
     (checked: boolean) => {
       if (checked) {
         if (liveModelDisabled || !liveModeWhisperOnlyCompatible) return;
+        // gh-102: same guard as handleStartRecording — refuse to start live
+        // mode when the active live model needs an explicit source language
+        // and the dashboard cannot resolve one. The current UI gates live
+        // mode to Whisper-only models (which do support auto-detect), so
+        // this is mostly defense-in-depth, but the guard keeps the contract
+        // honest if that gate is ever loosened.
+        const resolvedLiveLang = resolveLanguage(liveLanguage);
+        if (resolvedLiveLang === undefined && !supportsAutoDetect(activeLiveModel)) {
+          toast.error('Source language required', {
+            description: languagesLoading
+              ? 'Loading languages — please try again in a moment.'
+              : liveLanguage
+                ? `"${liveLanguage}" is not a valid source language for the active live model. Pick a language from the Live Source Language dropdown.`
+                : 'No source language is selected. Pick a language from the Live Source Language dropdown.',
+          });
+          return;
+        }
         const isSystemAudio = audioSource === 'system';
         const liveTranslateActive = isCanaryLiveBidi ? liveBidiTarget !== 'Off' : liveTranslate;
         const liveTranslateTarget = isCanaryLiveBidi
@@ -810,7 +932,7 @@ export const SessionView: React.FC<SessionViewProps> = ({
           }
 
           live.start({
-            language: resolveLanguage(liveLanguage),
+            language: resolvedLiveLang,
             deviceId: isSystemAudio ? undefined : micDeviceIds[micDevice],
             translate: liveTranslateActive,
             translationTarget: liveTranslateTarget,
@@ -848,6 +970,8 @@ export const SessionView: React.FC<SessionViewProps> = ({
       sysDevice,
       sinkNameMap,
       captureGain,
+      activeLiveModel,
+      languagesLoading,
     ],
   );
 
@@ -1163,9 +1287,16 @@ export const SessionView: React.FC<SessionViewProps> = ({
       )}
 
       {/* 2. Main Content Area */}
-      <div className="grid min-h-0 flex-1 grid-cols-1 items-stretch gap-6 lg:grid-cols-[minmax(480px,5fr)_minmax(300px,7fr)]">
+      <div className="custom-scrollbar grid min-h-0 flex-1 grid-cols-1 items-stretch gap-6 @max-[840px]:overflow-y-auto @min-[840px]:grid-cols-[minmax(480px,5fr)_minmax(300px,7fr)]">
         {/* Left Column: Controls (40%) */}
-        <div className="relative flex min-h-0 min-w-0 flex-col overflow-hidden rounded-2xl">
+        {/* min-h-0 is gated to @min-[840px] (wide mode) ON PURPOSE: in the two-column
+            layout it lets the inner flex-1 scroll area engage. In stacked mode it must
+            NOT apply — with min-h-0 the grid treats each row minimum as 0, sees the
+            fixed grid height as free space, and stretches both auto rows to equal
+            heights; the real (taller) content then spills out via overflow-visible and
+            the two columns paint on top of each other. Without min-h-0 the rows size to
+            content and stack cleanly as one scrolling column. */}
+        <div className="relative flex min-w-0 flex-col overflow-hidden rounded-2xl @max-[840px]:overflow-visible @min-[840px]:min-h-0">
           {/* Left Top Scroll Indicator */}
           <div
             className={`pointer-events-none absolute top-0 right-3 left-0 z-20 h-6 overflow-hidden rounded-t-2xl transition-opacity duration-300 ${leftScrollState.top ? 'opacity-100' : 'opacity-0'}`}
@@ -1180,7 +1311,7 @@ export const SessionView: React.FC<SessionViewProps> = ({
           </div>
           {/* Left Top Corner Mask */}
           <div
-            className="pointer-events-none absolute top-0 right-3 z-20 h-4 w-4"
+            className="pointer-events-none absolute top-0 right-3 z-20 h-4 w-4 @max-[840px]:hidden"
             style={{
               ...maskStyle,
               maskImage: 'radial-gradient(circle at bottom left, transparent 1rem, black 1rem)',
@@ -1192,21 +1323,26 @@ export const SessionView: React.FC<SessionViewProps> = ({
           {/* Main Scrollable Area for Left Column */}
           <div
             ref={leftScrollRef}
-            className="custom-scrollbar flex-1 overflow-y-auto pt-0 pr-3 pb-0"
+            className="custom-scrollbar flex-1 overflow-y-auto pt-0 pr-3 pb-0 @max-[840px]:overflow-visible"
           >
+            {/* Baseline min-height keeps short content filling the column in the two-column
+                layout only — applied via a CSS var gated behind @min-[840px] so it no-ops
+                when stacked (spec: baseline-height effect must no-op when stacked). */}
             <div
               ref={leftContentRef}
-              className="space-y-6"
+              className="space-y-6 @min-[840px]:[min-height:var(--ts-col-baseline)]"
               style={
                 leftColumnBaselineHeight
-                  ? { minHeight: `${leftColumnBaselineHeight}px` }
+                  ? ({
+                      '--ts-col-baseline': `${leftColumnBaselineHeight}px`,
+                    } as React.CSSProperties)
                   : undefined
               }
             >
               {/* Unified Control Center */}
               <GlassCard
                 title="Control Center"
-                className={`from-glass-200 to-glass-100 relative flex-none bg-linear-to-b transition-all duration-500 ease-in-out ${isSystemHealthy ? 'border-accent-cyan/50! z-10 shadow-[0_20px_25px_-5px_rgba(0,0,0,0.3),0_8px_10px_-6px_rgba(0,0,0,0.3),inset_0_0_30px_rgba(34,211,238,0.15)]!' : ''}`}
+                className={`blur-panel from-glass-200 to-glass-100 relative flex-none bg-linear-to-b transition-all duration-500 ease-in-out ${isSystemHealthy ? 'border-accent-cyan/50! z-10 shadow-[0_20px_25px_-5px_rgba(0,0,0,0.3),0_8px_10px_-6px_rgba(0,0,0,0.3),inset_0_0_30px_rgba(34,211,238,0.15)]!' : ''}`}
               >
                 <div className="space-y-5">
                   {/* Server Control */}
@@ -1504,6 +1640,24 @@ export const SessionView: React.FC<SessionViewProps> = ({
                         </span>
                       </div>
                     )}
+                    {/* gh-86 #1: review-cycle patches — drop `!mainModelDisabled`
+                        gate (existing model warning needs `serverConnection.ready`,
+                        so the two warnings are naturally non-overlapping; the prior
+                        gate created a silent-disabled gap when both fired); also
+                        suppress when `gpu_error` is set so the red GPU warning
+                        above owns that surface (the "loading" text would be
+                        misleading when the model can't load at all). */}
+                    {canStartRecording &&
+                      recordingDisabledReason !== '' &&
+                      !serverConnection.details?.gpu_error && (
+                        <div
+                          data-testid="recording-disabled-reason"
+                          className="flex items-start gap-2 rounded-lg border border-amber-500/20 bg-amber-500/10 px-3 py-2 text-xs text-amber-300"
+                        >
+                          <AlertTriangle size={14} className="mt-0.5 shrink-0" />
+                          <span>{recordingDisabledReason}</span>
+                        </div>
+                      )}
                     <div className="flex items-center gap-2">
                       {canStartRecording ? (
                         <Button
@@ -1567,15 +1721,20 @@ export const SessionView: React.FC<SessionViewProps> = ({
                   {/* Transcription Result */}
                   {transcription.result && (
                     <div className="space-y-2">
-                      <div className="selectable-text custom-scrollbar max-h-32 overflow-y-auto rounded-xl border border-white/5 bg-black/20 p-4 font-mono text-sm leading-relaxed text-slate-300">
-                        {transcription.result.text}
-                        {transcription.result.language && (
-                          <div className="mt-2 text-xs text-slate-500">
-                            Detected: {transcription.result.language} &middot;{' '}
-                            {transcription.result.duration?.toFixed(1)}s
-                          </div>
-                        )}
-                      </div>
+                      <FindReplaceTextEditor
+                        value={editedResultText}
+                        onChange={setEditedResultText}
+                        ariaLabel="Transcription result"
+                        placeholder="Transcription result"
+                        className="selectable-text rounded-xl border border-white/5 bg-black/20 p-4"
+                        textClassName="custom-scrollbar max-h-72 min-h-[8rem] overflow-y-auto font-mono text-sm leading-relaxed text-slate-300"
+                      />
+                      {transcription.result.language && (
+                        <div className="text-xs text-slate-500">
+                          Detected: {transcription.result.language} &middot;{' '}
+                          {transcription.result.duration?.toFixed(1)}s
+                        </div>
+                      )}
                       <div className="flex items-center gap-2">
                         <Button
                           variant="secondary"
@@ -1780,7 +1939,7 @@ export const SessionView: React.FC<SessionViewProps> = ({
           </div>
           {/* Left Bottom Corner Mask */}
           <div
-            className="pointer-events-none absolute right-3 bottom-0 z-20 h-4 w-4"
+            className="pointer-events-none absolute right-3 bottom-0 z-20 h-4 w-4 @max-[840px]:hidden"
             style={{
               ...maskStyle,
               maskImage: 'radial-gradient(circle at top left, transparent 1rem, black 1rem)',
@@ -1790,7 +1949,12 @@ export const SessionView: React.FC<SessionViewProps> = ({
         </div>
 
         {/* Right Column: Visualizer & Live Mode (60%) */}
-        <div className="relative flex min-h-0 min-w-0 flex-col overflow-hidden rounded-2xl">
+        {/* @max-[840px]: stacks below the left column as one scrolling grid, and slides in
+            via the reflowStackIn keyframe (motion-safe only — reduced-motion = instant).
+            min-h-0 is gated to @min-[840px] for the same reason as the left column: in
+            stacked mode it would let the grid stretch the rows to equal heights and cause
+            the panels to overlap. */}
+        <div className="relative flex min-w-0 flex-col overflow-hidden rounded-2xl @max-[840px]:overflow-visible @max-[840px]:motion-safe:animate-[reflowStackIn_0.3s_cubic-bezier(0.16,1,0.3,1)] @min-[840px]:min-h-0">
           {/* Right Top Scroll Indicator */}
           <div
             className={`pointer-events-none absolute top-0 right-3 left-0 z-20 h-6 overflow-hidden rounded-t-2xl transition-opacity duration-300 ${rightScrollState.top ? 'opacity-100' : 'opacity-0'}`}
@@ -1805,7 +1969,7 @@ export const SessionView: React.FC<SessionViewProps> = ({
           </div>
           {/* Right Top Corner Mask */}
           <div
-            className="pointer-events-none absolute top-0 right-3 z-20 h-4 w-4"
+            className="pointer-events-none absolute top-0 right-3 z-20 h-4 w-4 @max-[840px]:hidden"
             style={{
               ...maskStyle,
               maskImage: 'radial-gradient(circle at bottom left, transparent 1rem, black 1rem)',
@@ -1817,14 +1981,18 @@ export const SessionView: React.FC<SessionViewProps> = ({
           {/* Right Column Scroll Container */}
           <div
             ref={rightScrollRef}
-            className="custom-scrollbar flex-1 overflow-y-auto pt-0 pr-3 pb-0"
+            className="custom-scrollbar flex-1 overflow-y-auto pt-0 pr-3 pb-0 @max-[840px]:overflow-visible"
           >
+            {/* Baseline min-height applies in the two-column layout only (see left column);
+                gated behind @min-[840px] so it no-ops when stacked. */}
             <div
               ref={rightContentRef}
-              className="flex min-h-full flex-col"
+              className="flex min-h-full flex-col @min-[840px]:[min-height:var(--ts-col-baseline)]"
               style={
                 rightColumnBaselineHeight
-                  ? { minHeight: `${rightColumnBaselineHeight}px` }
+                  ? ({
+                      '--ts-col-baseline': `${rightColumnBaselineHeight}px`,
+                    } as React.CSSProperties)
                   : undefined
               }
             >
@@ -2018,84 +2186,27 @@ export const SessionView: React.FC<SessionViewProps> = ({
                           variant="ghost"
                           size="sm"
                           icon={<Copy size={14} />}
-                          onClick={() => {
-                            writeToClipboard(live.getText());
-                            live.clearHistory();
-                          }}
+                          onClick={handleLiveCopyAndClear}
                           className="ml-auto h-8 shrink-0 whitespace-nowrap"
                         >
                           Copy
                         </Button>
                       </div>
                       {/* Transcript Area */}
-                      <div
-                        ref={liveTranscriptRef}
-                        className="custom-scrollbar selectable-text relative min-h-0 flex-1 overflow-y-auto rounded-xl border border-white/5 bg-black/20 p-4 font-mono text-sm leading-relaxed text-slate-300 shadow-inner"
-                      >
-                        {(serverRunning || isRemoteMode) &&
-                          serverConnection.ready &&
-                          liveModelDisabled && (
-                            <div className="mb-3 text-xs text-amber-300">
-                              Live model not selected.
-                            </div>
-                          )}
-                        {!liveModelDisabled && !liveModeWhisperOnlyCompatible && (
-                          <div className="mb-3 text-xs text-red-400">
-                            {liveModeUnsupportedMessage}
-                          </div>
-                        )}
-                        {isLive || live.sentences.length > 0 || live.partial ? (
-                          <>
-                            {live.statusMessage && (
-                              <div className="text-accent-cyan mb-3 flex animate-pulse items-center gap-2">
-                                <Loader2 size={14} className="animate-spin" />
-                                <span className="text-xs">{live.statusMessage}</span>
-                              </div>
-                            )}
-                            {live.sentences.map((s, i) => (
-                              <div key={i} className="mb-2">
-                                {!hideTimestamps && (
-                                  <span className="mr-2 text-slate-500 select-none">
-                                    {new Date(s.timestamp).toLocaleTimeString('en-US', {
-                                      hour12: false,
-                                    })}
-                                  </span>
-                                )}
-                                <span>{s.text}</span>
-                              </div>
-                            ))}
-                            {live.partial && (
-                              <div className="mb-2 opacity-60">
-                                {!hideTimestamps && (
-                                  <span className="mr-2 text-slate-500 select-none">
-                                    {new Date().toLocaleTimeString('en-US', { hour12: false })}
-                                  </span>
-                                )}
-                                <span className="italic">{live.partial}</span>
-                                <span className="bg-accent-cyan ml-0.5 inline-block h-4 w-1.5 animate-pulse align-text-bottom"></span>
-                              </div>
-                            )}
-                            {live.sentences.length === 0 &&
-                              !live.partial &&
-                              !live.statusMessage && (
-                                <div className="absolute inset-4 flex flex-col items-center justify-center space-y-3 text-slate-600 opacity-60 select-none">
-                                  <Activity size={32} strokeWidth={1} className="animate-pulse" />
-                                  <p>Listening... speak to see transcription.</p>
-                                </div>
-                              )}
-                            {live.error && (
-                              <div className="mt-2 text-xs text-red-400">{live.error}</div>
-                            )}
-                          </>
-                        ) : (
-                          <div className="absolute inset-4 flex items-center justify-center">
-                            <div className="flex flex-col items-center space-y-3 text-center text-slate-600 opacity-60 select-none">
-                              <Radio size={48} strokeWidth={1} />
-                              <p>Live mode is off. Toggle the switch to start.</p>
-                            </div>
-                          </div>
-                        )}
-                      </div>
+                      <LiveTranscriptView
+                        live={live}
+                        isLive={isLive}
+                        hideTimestamps={hideTimestamps}
+                        serverRunning={serverRunning}
+                        isRemoteMode={isRemoteMode}
+                        serverReady={serverConnection.ready}
+                        liveModelDisabled={liveModelDisabled}
+                        liveModeWhisperOnlyCompatible={liveModeWhisperOnlyCompatible}
+                        liveModeUnsupportedMessage={liveModeUnsupportedMessage}
+                        transcriptRef={liveTranscriptRef}
+                        editedLiveText={editedLiveText}
+                        onEditedLiveChange={handleEditedLiveChange}
+                      />
                     </div>
                   </PopOutWindow>
                 </>
@@ -2194,10 +2305,7 @@ export const SessionView: React.FC<SessionViewProps> = ({
                       variant="ghost"
                       size="sm"
                       icon={<Copy size={14} />}
-                      onClick={() => {
-                        writeToClipboard(live.getText());
-                        live.clearHistory();
-                      }}
+                      onClick={handleLiveCopyAndClear}
                       className="ml-auto h-8 shrink-0 whitespace-nowrap"
                     >
                       Copy
@@ -2205,68 +2313,20 @@ export const SessionView: React.FC<SessionViewProps> = ({
                   </div>
 
                   {/* Transcript Area */}
-                  <div
-                    ref={liveTranscriptRef}
-                    className="custom-scrollbar selectable-text relative min-h-0 flex-1 overflow-y-auto rounded-xl border border-white/5 bg-black/20 p-4 font-mono text-sm leading-relaxed text-slate-300 shadow-inner"
-                  >
-                    {(serverRunning || isRemoteMode) &&
-                      serverConnection.ready &&
-                      liveModelDisabled && (
-                        <div className="mb-3 text-xs text-amber-300">Live model not selected.</div>
-                      )}
-                    {!liveModelDisabled && !liveModeWhisperOnlyCompatible && (
-                      <div className="mb-3 text-xs text-red-400">{liveModeUnsupportedMessage}</div>
-                    )}
-                    {isLive || live.sentences.length > 0 || live.partial ? (
-                      <>
-                        {live.statusMessage && (
-                          <div className="text-accent-cyan mb-3 flex animate-pulse items-center gap-2">
-                            <Loader2 size={14} className="animate-spin" />
-                            <span className="text-xs">{live.statusMessage}</span>
-                          </div>
-                        )}
-                        {live.sentences.map((s, i) => (
-                          <div key={i} className="mb-2">
-                            {!hideTimestamps && (
-                              <span className="mr-2 text-slate-500 select-none">
-                                {new Date(s.timestamp).toLocaleTimeString('en-US', {
-                                  hour12: false,
-                                })}
-                              </span>
-                            )}
-                            <span>{s.text}</span>
-                          </div>
-                        ))}
-                        {live.partial && (
-                          <div className="mb-2 opacity-60">
-                            {!hideTimestamps && (
-                              <span className="mr-2 text-slate-500 select-none">
-                                {new Date().toLocaleTimeString('en-US', { hour12: false })}
-                              </span>
-                            )}
-                            <span className="italic">{live.partial}</span>
-                            <span className="bg-accent-cyan ml-0.5 inline-block h-4 w-1.5 animate-pulse align-text-bottom"></span>
-                          </div>
-                        )}
-                        {live.sentences.length === 0 && !live.partial && !live.statusMessage && (
-                          <div className="absolute inset-4 flex flex-col items-center justify-center space-y-3 text-slate-600 opacity-60 select-none">
-                            <Activity size={32} strokeWidth={1} className="animate-pulse" />
-                            <p>Listening... speak to see transcription.</p>
-                          </div>
-                        )}
-                        {live.error && (
-                          <div className="mt-2 text-xs text-red-400">{live.error}</div>
-                        )}
-                      </>
-                    ) : (
-                      <div className="absolute inset-4 flex items-center justify-center">
-                        <div className="flex flex-col items-center space-y-3 text-center text-slate-600 opacity-60 select-none">
-                          <Radio size={48} strokeWidth={1} />
-                          <p>Live mode is off. Toggle the switch to start.</p>
-                        </div>
-                      </div>
-                    )}
-                  </div>
+                  <LiveTranscriptView
+                    live={live}
+                    isLive={isLive}
+                    hideTimestamps={hideTimestamps}
+                    serverRunning={serverRunning}
+                    isRemoteMode={isRemoteMode}
+                    serverReady={serverConnection.ready}
+                    liveModelDisabled={liveModelDisabled}
+                    liveModeWhisperOnlyCompatible={liveModeWhisperOnlyCompatible}
+                    liveModeUnsupportedMessage={liveModeUnsupportedMessage}
+                    transcriptRef={liveTranscriptRef}
+                    editedLiveText={editedLiveText}
+                    onEditedLiveChange={handleEditedLiveChange}
+                  />
                 </GlassCard>
               )}
             </div>
@@ -2286,7 +2346,7 @@ export const SessionView: React.FC<SessionViewProps> = ({
           </div>
           {/* Right Bottom Corner Mask */}
           <div
-            className="pointer-events-none absolute right-3 bottom-0 z-20 h-4 w-4"
+            className="pointer-events-none absolute right-3 bottom-0 z-20 h-4 w-4 @max-[840px]:hidden"
             style={{
               ...maskStyle,
               maskImage: 'radial-gradient(circle at top left, transparent 1rem, black 1rem)',

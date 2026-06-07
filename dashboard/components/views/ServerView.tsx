@@ -16,6 +16,7 @@ import {
   RotateCcw,
   Copy,
   Check,
+  FolderOpen,
   Eye,
   EyeOff,
   Users,
@@ -34,14 +35,22 @@ import { NvidiaIcon } from '../ui/icons/NvidiaIcon';
 import { AmdIcon } from '../ui/icons/AmdIcon';
 import { IntelIcon } from '../ui/icons/IntelIcon';
 import { AppleIcon } from '../ui/icons/AppleIcon';
+import { GpuHealthCard } from './GpuHealthCard';
+import { GpuDiagnosticModal, type GpuDiagnosticResultProp } from './GpuDiagnosticModal';
 
 import { useActivityStore } from '../../src/stores/activityStore';
 import { useAdminStatus } from '../../src/hooks/useAdminStatus';
+import { useServerStatus } from '../../src/hooks/useServerStatus';
 import { useDockerContext } from '../../src/hooks/DockerContext';
 import { apiClient } from '../../src/api/client';
 import { writeToClipboard } from '../../src/hooks/useClipboard';
 import { formatDateDMY, compareVersionTags } from '../../src/services/versionUtils';
-import { isWhisperModel, isMLXModel } from '../../src/services/modelCapabilities';
+import {
+  isWhisperModel,
+  isWhisperCppModel,
+  isMLXModel,
+  isNemoModel,
+} from '../../src/services/modelCapabilities';
 import { MODEL_REGISTRY, getModelsByFamily } from '../../src/services/modelRegistry';
 import {
   MODEL_DEFAULT_LOADING_PLACEHOLDER,
@@ -84,14 +93,16 @@ interface ServerViewProps {
 const DIARIZATION_SORTFORMER_OPTION = 'Sortformer (Metal; ≤ 4 speakers)';
 const DIARIZATION_DEFAULT_MODEL = 'pyannote/speaker-diarization-community-1';
 const DIARIZATION_MODEL_CUSTOM_OPTION = 'Custom (HuggingFace repo)';
+// Mac Metal gating: pyannote.audio 4.x has no working MPS path
+// (pyannote/pyannote-audio#1886, #1337, #1091 — all closed wontfix).
+const PYANNOTE_REPO_PATTERN = /^pyannote\//i;
 
-// GGML model options for Vulkan sidecar — computed once from registry.
+// GGML models for the Vulkan sidecar — computed once from registry. In Vulkan
+// mode these populate the Main Transcriber dropdown (Branch B: the main pick
+// drives the sidecar). GGML_DISPLAY_TO_ID is retained only to migrate the
+// legacy `server.whispercppModel` value (persisted as a display name).
 const GGML_MODELS = getModelsByFamily('whispercpp');
-const GGML_OPTIONS = GGML_MODELS.map((m) => m.displayName);
 const GGML_DISPLAY_TO_ID = new Map(GGML_MODELS.map((m) => [m.displayName, m.id]));
-const GGML_ID_TO_DISPLAY = new Map(GGML_MODELS.map((m) => [m.id, m.displayName]));
-const GGML_DEFAULT_DISPLAY =
-  GGML_ID_TO_DISPLAY.get('ggml-large-v3-turbo.bin') ?? 'GGML Large v3 Turbo';
 const ACTIVE_CARD_ACCENT_CLASS = 'border-accent-cyan/40! shadow-[0_0_15px_rgba(34,211,238,0.2)]!';
 const FALLBACK_LIVE_WHISPER_MODEL = WHISPER_MEDIUM;
 
@@ -141,9 +152,18 @@ function getString(value: unknown): string | null {
   return trimmed.length > 0 ? trimmed : null;
 }
 
-// Session-level GPU detection cache — survives view unmount/remount
-let cachedGpuInfo: { gpu: boolean; toolkit: boolean; vulkan: boolean } | null | undefined =
-  undefined; // undefined = not yet checked
+// Session-level GPU detection cache — survives view unmount/remount.
+// `wslSupport` is populated by `checkGpu()` only on Win32 (GH-101 follow-up);
+// it gates the experimental Vulkan-WSL2 runtime profile button below.
+let cachedGpuInfo:
+  | {
+      gpu: boolean;
+      toolkit: boolean;
+      vulkan: boolean;
+      wslSupport?: { available: boolean; gpuPassthroughDetected: boolean; reason?: string };
+    }
+  | null
+  | undefined = undefined; // undefined = not yet checked
 
 function normalizeModelName(value: string): string {
   return value.trim().toLowerCase();
@@ -156,9 +176,13 @@ function findCaseInsensitivePreset(value: string, options: string[]): string | n
   return match ?? null;
 }
 
+function isLiveCompatibleModel(modelName: string): boolean {
+  return isWhisperModel(modelName) || isWhisperCppModel(modelName);
+}
+
 function normalizeLiveModelToWhisper(modelName: string): string {
   if (modelName === DISABLED_MODEL_SENTINEL) return modelName;
-  return isWhisperModel(modelName) ? modelName : FALLBACK_LIVE_WHISPER_MODEL;
+  return isLiveCompatibleModel(modelName) ? modelName : FALLBACK_LIVE_WHISPER_MODEL;
 }
 
 function mapMainModelToSelection(modelName: string): { selection: string; custom: string } {
@@ -184,7 +208,7 @@ function mapLiveModelToSelection(
 
   const normalizedLiveModel = normalizeLiveModelToWhisper(modelName);
   if (
-    isWhisperModel(mainModelName) &&
+    isLiveCompatibleModel(mainModelName) &&
     normalizeModelName(normalizedLiveModel) === normalizeModelName(mainModelName)
   ) {
     return { selection: LIVE_MODEL_SAME_AS_MAIN_OPTION, custom: '' };
@@ -224,7 +248,6 @@ export const ServerView: React.FC<ServerViewProps> = ({ onStartServer, startupFl
   );
   const [diarizationCustomModel, setDiarizationCustomModel] = useState('');
   const [diarizationHydrated, setDiarizationHydrated] = useState(false);
-  const [whispercppModelSelection, setWhispercppModelSelection] = useState(GGML_DEFAULT_DISPLAY);
   const [modelsLoading, setModelsLoading] = useState(false);
 
   // Model download cache state (checks Docker volume for HF model dirs)
@@ -272,16 +295,51 @@ export const ServerView: React.FC<ServerViewProps> = ({ onStartServer, startupFl
       .catch(() => {});
   }, []);
 
+  // Per-row "copied" feedback for the persistent-volume path actions (GH-137).
+  const [copiedPath, setCopiedPath] = useState<string | null>(null);
+
+  // Open a native directory in the OS file manager; on failure (e.g. the dir
+  // does not exist yet) fall back to its parent.
+  const handleOpenNativePath = useCallback(async (dir: string | null) => {
+    if (!dir) return;
+    const api = (window as any).electronAPI;
+    if (!api?.app?.openPath) return;
+    try {
+      const err: string = await api.app.openPath(dir);
+      if (err) {
+        const parent = dir.replace(/[\\/]+[^\\/]*[\\/]*$/, '');
+        if (parent && parent !== dir) await api.app.openPath(parent).catch(() => {});
+      }
+    } catch {
+      /* best-effort — opening a folder must never crash the view */
+    }
+  }, []);
+
+  const handleCopyNativePath = useCallback((dir: string | null, label: string) => {
+    if (!dir) return;
+    writeToClipboard(dir).catch(() => {});
+    setCopiedPath(label);
+    setTimeout(() => setCopiedPath((c) => (c === label ? null : c)), 2000);
+  }, []);
+
   // Derive model option lists filtered by the active runtime profile.
   // Metal mode:     only MLX models (non-MLX need Docker/ctranslate2).
   // Non-Metal mode: only non-MLX models (MLX needs Apple Silicon Metal).
   const isMetal = runtimeProfile === 'metal';
+  const isVulkan = runtimeProfile === 'vulkan' || runtimeProfile === 'vulkan-wsl2';
   const mainModelOptions = useMemo(() => {
+    // Vulkan: the Main Transcriber owns the whisper.cpp sidecar's model, so the
+    // dropdown is restricted to GGML models. WHISPERCPP_MODEL is derived from
+    // this pick at start (no separate sidecar selector). Custom is omitted —
+    // only registry GGML files exist on disk for the sidecar to load.
+    if (isVulkan) {
+      return [...GGML_MODELS.map((m) => m.id), MODEL_DISABLED_OPTION];
+    }
     const presets = MAIN_MODEL_PRESETS.filter((id) =>
       isMetal ? MLX_MODEL_IDS.has(id) : !MLX_MODEL_IDS.has(id),
     );
     return [...presets, MODEL_DISABLED_OPTION, MAIN_MODEL_CUSTOM_OPTION];
-  }, [isMetal]);
+  }, [isMetal, isVulkan]);
   const liveModelOptions = useMemo(() => {
     return [
       LIVE_MODEL_SAME_AS_MAIN_OPTION,
@@ -290,6 +348,18 @@ export const ServerView: React.FC<ServerViewProps> = ({ onStartServer, startupFl
       LIVE_MODEL_CUSTOM_OPTION,
     ];
   }, []);
+  // Diarization options: omit pyannote on Mac Metal — pyannote.audio MPS path is broken upstream.
+  const diarizationOptions = useMemo(
+    () =>
+      isMetal
+        ? [DIARIZATION_SORTFORMER_OPTION, DIARIZATION_MODEL_CUSTOM_OPTION]
+        : [
+            DIARIZATION_SORTFORMER_OPTION,
+            DIARIZATION_DEFAULT_MODEL,
+            DIARIZATION_MODEL_CUSTOM_OPTION,
+          ],
+    [isMetal],
+  );
 
   // Auth token display in Instance Settings
   const [showAuthToken, setShowAuthToken] = useState(false);
@@ -323,8 +393,23 @@ export const ServerView: React.FC<ServerViewProps> = ({ onStartServer, startupFl
         .get('server.runtimeProfile')
         .then((val: unknown) => {
           if (isRuntimeProfile(val)) {
-            setRuntimeProfile(val);
-            if (val === 'vulkan') {
+            // Normalize stale 'vulkan-wsl2' if the profile was persisted on a
+            // Win32 host and the user has since moved the dashboard to Linux
+            // or macOS (GH-101 follow-up). Otherwise the four-button row in
+            // the Instance Settings card would show no active state at all,
+            // and the user would have to dig through Settings to recover.
+            // Falling back to 'cpu' is the safe universal default; the
+            // auto-detect block below will pick a better profile if eligible
+            // (only runs once per machine, gated by `gpuAutoDetectDone`).
+            const normalized: RuntimeProfile =
+              val === 'vulkan-wsl2' && (window as any).electronAPI?.app?.getPlatform?.() !== 'win32'
+                ? 'cpu'
+                : val;
+            setRuntimeProfile(normalized);
+            if (normalized !== val) {
+              api.config?.set?.('server.runtimeProfile', normalized).catch(() => {});
+            }
+            if (normalized === 'vulkan') {
               docker
                 .hasSidecarImage()
                 .then((exists) => setSidecarNeeded(!exists))
@@ -375,6 +460,7 @@ export const ServerView: React.FC<ServerViewProps> = ({ onStartServer, startupFl
       api.config.get('server.diarizationModelSelection'),
       api.config.get('server.diarizationCustomModel'),
       api.config.get('server.whispercppModel'),
+      api.config.get('server.runtimeProfile'),
     ])
       .then(
         ([
@@ -385,6 +471,7 @@ export const ServerView: React.FC<ServerViewProps> = ({ onStartServer, startupFl
           storedDiarizationSelection,
           storedDiarizationCustom,
           storedWhispercppModel,
+          storedRuntimeProfile,
         ]: unknown[]) => {
           if (!active) return;
 
@@ -448,7 +535,10 @@ export const ServerView: React.FC<ServerViewProps> = ({ onStartServer, startupFl
             resolvedMainModel,
             '',
           );
-          if (resolvedLiveModel !== DISABLED_MODEL_SENTINEL && !isWhisperModel(resolvedLiveModel)) {
+          if (
+            resolvedLiveModel !== DISABLED_MODEL_SENTINEL &&
+            !isLiveCompatibleModel(resolvedLiveModel)
+          ) {
             nextLiveSelection = FALLBACK_LIVE_WHISPER_MODEL;
             nextLiveCustom = '';
           }
@@ -479,23 +569,31 @@ export const ServerView: React.FC<ServerViewProps> = ({ onStartServer, startupFl
             nextDiarizationCustom = '';
           }
 
+          // Branch B migration: the dedicated "GGML Sidecar Model" selector is
+          // gone — the Main Transcriber now owns the sidecar model in Vulkan
+          // mode. If a user is upgrading from that era and their persisted main
+          // pick isn't a GGML model, seed it from the old `server.whispercppModel`
+          // value (stored as a display name) or the recommended GGML, so the
+          // sidecar always has a valid model to load.
+          const storedProfile = getString(storedRuntimeProfile);
+          const isVulkanProfile = storedProfile === 'vulkan' || storedProfile === 'vulkan-wsl2';
+          if (isVulkanProfile && !isWhisperCppModel(resolvedMainModel)) {
+            const storedGgml = getString(storedWhispercppModel);
+            const migratedId =
+              (storedGgml &&
+                (GGML_DISPLAY_TO_ID.get(storedGgml) ??
+                  (isWhisperCppModel(storedGgml) ? storedGgml : undefined))) ??
+              VULKAN_RECOMMENDED_MODEL;
+            nextMainSelection = migratedId;
+            nextMainCustom = '';
+          }
+
           setMainModelSelection(nextMainSelection);
           setMainCustomModel(nextMainCustom);
           setLiveModelSelection(nextLiveSelection);
           setLiveCustomModel(nextLiveCustom);
           setDiarizationModelSelection(nextDiarizationSelection);
           setDiarizationCustomModel(nextDiarizationCustom);
-          const storedGgml = getString(storedWhispercppModel);
-          if (storedGgml) {
-            if (GGML_DISPLAY_TO_ID.has(storedGgml)) {
-              // Stored as displayName — use directly
-              setWhispercppModelSelection(storedGgml);
-            } else {
-              // Stored as model ID — convert to displayName
-              const display = GGML_ID_TO_DISPLAY.get(storedGgml);
-              if (display) setWhispercppModelSelection(display);
-            }
-          }
         },
       )
       .catch(() => {})
@@ -525,6 +623,20 @@ export const ServerView: React.FC<ServerViewProps> = ({ onStartServer, startupFl
           api?.config?.set('server.mainModelSelection', MAIN_RECOMMENDED_MODEL);
         }
         if (MLX_MODEL_IDS.has(liveModelSelection)) {
+          setLiveModelSelection(LIVE_MODEL_SAME_AS_MAIN_OPTION);
+          api?.config?.set('server.liveModelSelection', LIVE_MODEL_SAME_AS_MAIN_OPTION);
+        }
+      }
+      // Switching to CPU: NeMo models (Parakeet/Canary) need a GPU to be
+      // practical and pull in the heavy `nemo` extra (GH-125). Reset a NeMo
+      // selection to a CPU-friendly faster-whisper default so CPU hosts skip the
+      // CUDA wheels and the NeMo install entirely.
+      if (profile === 'cpu') {
+        if (isNemoModel(mainModelSelection)) {
+          setMainModelSelection(WHISPER_MEDIUM);
+          api?.config?.set('server.mainModelSelection', WHISPER_MEDIUM);
+        }
+        if (isNemoModel(liveModelSelection)) {
           setLiveModelSelection(LIVE_MODEL_SAME_AS_MAIN_OPTION);
           api?.config?.set('server.liveModelSelection', LIVE_MODEL_SAME_AS_MAIN_OPTION);
         }
@@ -791,9 +903,17 @@ export const ServerView: React.FC<ServerViewProps> = ({ onStartServer, startupFl
     configuredLiveModel,
   );
   const normalizedLiveModel = normalizeLiveModelToWhisper(activeLiveModel);
+  // Vulkan sidecar boot/launch model, derived from the Main Transcriber pick
+  // (Branch B). The backend swaps to the live model at runtime via /load; this
+  // is only the model the sidecar pre-loads at startup. Guarded so a non-GGML
+  // value can never reach the sidecar.
+  const vulkanSidecarModelPath = `/models/${
+    isWhisperCppModel(activeTranscriber) ? activeTranscriber : VULKAN_RECOMMENDED_MODEL
+  }`;
   const liveModelWhisperOnlyCompatible =
-    activeLiveModel === DISABLED_MODEL_SENTINEL || isWhisperModel(activeLiveModel);
-  const liveModeModelConstraintMessage = 'Live Mode only supports faster-whisper models.';
+    activeLiveModel === DISABLED_MODEL_SENTINEL || isLiveCompatibleModel(activeLiveModel);
+  const liveModeModelConstraintMessage =
+    'Live Mode supports faster-whisper and whisper.cpp (GGML) models.';
 
   // Active diarization model name — empty string = Sortformer (server auto-select)
   const activeDiarizationModel =
@@ -932,17 +1052,29 @@ export const ServerView: React.FC<ServerViewProps> = ({ onStartServer, startupFl
     activeDiarizationModel,
   ]);
 
-  // Hard-reset any non-whisper live model selection to the default whisper model.
+  // Hard-reset any non-Live-compatible model selection to the default whisper model.
+  // Live Mode accepts faster-whisper and whisper.cpp (GGML) backends.
   useEffect(() => {
     if (
       !localSelectionsHydrated ||
       activeLiveModel === DISABLED_MODEL_SENTINEL ||
-      isWhisperModel(activeLiveModel)
+      isLiveCompatibleModel(activeLiveModel)
     )
       return;
     setLiveModelSelection(FALLBACK_LIVE_WHISPER_MODEL);
     setLiveCustomModel('');
   }, [activeLiveModel, localSelectionsHydrated]);
+
+  // Mac Metal: auto-migrate persisted Pyannote diarization choice to Sortformer.
+  // Single effect handles both initial mount AND mid-session profile toggles
+  // (runtimeProfile is hydrated by a separate effect, so we cannot extend the
+  // diarization Promise.all chain). The state change is persisted by the
+  // existing auto-persist effect at line ~1019. See pyannote/pyannote-audio#1886.
+  useEffect(() => {
+    if (!isMetal || !diarizationHydrated) return;
+    if (diarizationModelSelection !== DIARIZATION_DEFAULT_MODEL) return;
+    setDiarizationModelSelection(DIARIZATION_SORTFORMER_OPTION);
+  }, [isMetal, diarizationHydrated, diarizationModelSelection]);
 
   // Metal mode: auto-switch a non-MLX main model to the MLX default.
   useEffect(() => {
@@ -999,13 +1131,6 @@ export const ServerView: React.FC<ServerViewProps> = ({ onStartServer, startupFl
     void api.config.set('server.diarizationCustomModel', diarizationCustomModel).catch(() => {});
   }, [localSelectionsHydrated, diarizationCustomModel]);
 
-  useEffect(() => {
-    if (!localSelectionsHydrated) return;
-    const api = (window as any).electronAPI;
-    if (!api?.config) return;
-    void api.config.set('server.whispercppModel', whispercppModelSelection).catch(() => {});
-  }, [localSelectionsHydrated, whispercppModelSelection]);
-
   // Check model download cache whenever the active model names or container state change
   useEffect(() => {
     const api = (window as any).electronAPI;
@@ -1053,15 +1178,6 @@ export const ServerView: React.FC<ServerViewProps> = ({ onStartServer, startupFl
     }
     return meta;
   }, [runtimeProfile]);
-
-  // Show a suggestion to use the recommended GGML model when the user switches to Vulkan
-  // mode and their current main model selection requires CUDA (not usable in Vulkan mode).
-  // Skips sentinels, custom options, and models that are already Vulkan-compatible.
-  const showVulkanModelSuggestion =
-    runtimeProfile === 'vulkan' &&
-    !isRunning &&
-    mainModelSelection !== VULKAN_RECOMMENDED_MODEL &&
-    mainModelOptionMeta[mainModelSelection]?.badge === 'Requires CUDA';
 
   // ─── Image tag selection (merged remote + local) ─────────────────────────
 
@@ -1126,7 +1242,112 @@ export const ServerView: React.FC<ServerViewProps> = ({ onStartServer, startupFl
     gpu: boolean;
     toolkit: boolean;
     vulkan: boolean;
+    wslSupport?: { available: boolean; gpuPassthroughDetected: boolean; reason?: string };
   } | null>(cachedGpuInfo ?? null);
+
+  // ─── GPU Health Card state (NVIDIA Linux only) ─────────────────────────────
+  // Phase 2 of the CUDA error 999 recovery plan. Three pieces of state feed the
+  // GpuHealthCard rendered below the setup checklist:
+  //   - gpuPreflight: result of dockerManager.validateGpuPreflight() — cheap
+  //     host checks (CDI spec, /dev/char symlinks, nvidia_uvm). Drives the
+  //     yellow "may be misconfigured" state when a check fails.
+  //   - gpuBackendError: structured object built from useServerStatus()'s
+  //     gpuError + gpuErrorRecoveryHint when /api/status reports a GPU failure.
+  //     Drives the red "fell back to CPU" state with the recovery hint visible.
+  //   - hostPlatform: read once from electronAPI.app.getPlatform() so the card
+  //     can gate on Linux without depending on navigator.platform (which may
+  //     report 'Linux x86_64' or be absent in jsdom test mounts).
+  const [gpuPreflight, setGpuPreflight] = useState<{
+    status: 'healthy' | 'warning' | 'unknown';
+    checks: Array<{
+      name: string;
+      pass: boolean;
+      fixCommand?: string;
+      docsUrl?: string;
+    }>;
+  } | null>(null);
+  const [gpuBackendError, setGpuBackendError] = useState<{
+    status: 'unrecoverable';
+    error: string;
+    recovery_hint?: string;
+  } | null>(null);
+  const [hostPlatform, setHostPlatform] = useState<string>('unknown');
+
+  // Subscribe to backend GPU error via the existing useServerStatus poll
+  // (polls /api/status every 10s through React Query). When the backend
+  // reports gpuError, build the structured object the GpuHealthCard expects.
+  // The recovery_hint is only present when cuda_health_check matched the
+  // error-999 fingerprint; we pass it through verbatim.
+  const { gpuError, gpuErrorRecoveryHint, details, reachable } = useServerStatus();
+  useEffect(() => {
+    if (gpuError) {
+      setGpuBackendError({
+        status: 'unrecoverable',
+        error: gpuError,
+        recovery_hint: gpuErrorRecoveryHint ?? undefined,
+      });
+    } else {
+      setGpuBackendError(null);
+    }
+  }, [gpuError, gpuErrorRecoveryHint]);
+
+  // CPU-fallback mismatch: GPU (CUDA) is the selected runtime, the server is up
+  // and reachable, but the running container reports CUDA is NOT available
+  // inside it (started without GPU passthrough → silently transcribing on CPU).
+  // `=== false` (not falsy) so older servers / pre-init responses that omit the
+  // field do not trip a false warning. Surfaced by the GpuHealthCard.
+  const cpuFallbackActive =
+    runtimeProfile === 'gpu' && reachable && details?.gpu_available === false;
+
+  // Read host platform once via electronAPI bridge. Synchronous in production
+  // (preload returns process.platform directly); defaults to 'unknown' for
+  // jsdom/test mounts that don't expose getPlatform.
+  useEffect(() => {
+    const api = (window as any).electronAPI;
+    const getPlatformFn = api?.app?.getPlatform;
+    if (typeof getPlatformFn !== 'function') return;
+    try {
+      const p = getPlatformFn();
+      if (typeof p === 'string' && p) setHostPlatform(p);
+    } catch {
+      // Best-effort: leave hostPlatform as 'unknown'; card will not render.
+    }
+  }, []);
+
+  // Run-diagnostic handler for the "Run Full Diagnostic" button on the card.
+  // Awaits the docker:runGpuDiagnostic IPC, which spawns scripts/diagnose-gpu.sh,
+  // waits for it to finish, parses the log, and returns a structured summary.
+  // Result is surfaced in <GpuDiagnosticModal> below — replaces the original
+  // window.alert flow.
+  const [diagnosticRunning, setDiagnosticRunning] = useState(false);
+  const [diagnosticResult, setDiagnosticResult] = useState<GpuDiagnosticResultProp | null>(null);
+  const [diagnosticOpen, setDiagnosticOpen] = useState(false);
+
+  const handleRunGpuDiagnostic = useCallback((): void => {
+    const api = (window as any).electronAPI;
+    if (!api?.docker?.runGpuDiagnostic || diagnosticRunning) return;
+    setDiagnosticRunning(true);
+    api.docker
+      .runGpuDiagnostic()
+      .then((res: GpuDiagnosticResultProp) => {
+        if (res.status === 'unsupported') {
+          toast.message('GPU diagnostic is for Linux NVIDIA hosts only.');
+          return;
+        }
+        setDiagnosticResult(res);
+        setDiagnosticOpen(true);
+      })
+      .catch(() => {
+        toast.error('Failed to run GPU diagnostic — see console.');
+      })
+      .finally(() => {
+        setDiagnosticRunning(false);
+      });
+  }, [diagnosticRunning]);
+
+  const handleCloseDiagnostic = useCallback((): void => {
+    setDiagnosticOpen(false);
+  }, []);
 
   // Load dismissed state and GPU info on mount (GPU check cached per session)
   useEffect(() => {
@@ -1145,51 +1366,112 @@ export const ServerView: React.FC<ServerViewProps> = ({ onStartServer, startupFl
     if (cachedGpuInfo === undefined && api?.docker?.checkGpu) {
       api.docker
         .checkGpu()
-        .then((info: { gpu: boolean; toolkit: boolean; vulkan: boolean }) => {
-          cachedGpuInfo = info;
-          setGpuInfo(info);
-          // Auto-set runtime profile based on hardware detection.
-          // Runs exactly once: on fresh install or upgrade from a version without the flag.
-          // Priority: Metal (Apple Silicon) > NVIDIA GPU > Vulkan (AMD/Intel) > CPU
-          api.config
-            ?.get('server.gpuAutoDetectDone')
-            .then((done: unknown) => {
-              if (done === true) return; // already ran — respect user's stored choice
-              // Determine best profile for this hardware
-              let detected: RuntimeProfile = 'cpu';
-              if (metalSupported) {
-                detected = 'metal';
-              } else if (info.gpu && info.toolkit) {
-                detected = 'gpu';
-              } else if (info.vulkan) {
-                detected = 'vulkan';
-              }
-              handleRuntimeProfileChange(detected);
-              // If Metal was selected, also set the default MLX model
-              if (detected === 'metal') {
-                api.config
-                  ?.get('server.mainModelSelection')
-                  .then((modelVal: unknown) => {
-                    const cur = typeof modelVal === 'string' ? modelVal.trim() : '';
-                    if (!cur || cur === MODEL_DEFAULT_LOADING_PLACEHOLDER) {
-                      setMainModelSelection(MLX_DEFAULT_MODEL);
-                      api.config?.set('server.mainModelSelection', MLX_DEFAULT_MODEL);
-                      api.config?.set('server.mainCustomModel', '');
-                    }
-                  })
-                  .catch(() => {});
-              }
-              // Mark auto-detection as done so it never re-runs
-              api.config?.set('server.gpuAutoDetectDone', true);
-            })
-            .catch(() => {});
-        })
+        .then(
+          (info: {
+            gpu: boolean;
+            toolkit: boolean;
+            vulkan: boolean;
+            wslSupport?: { available: boolean; gpuPassthroughDetected: boolean; reason?: string };
+          }) => {
+            cachedGpuInfo = info;
+            setGpuInfo(info);
+            // Auto-set runtime profile based on hardware detection.
+            // Runs exactly once: on fresh install or upgrade from a version without the flag.
+            // Priority: Metal (Apple Silicon) > NVIDIA GPU > Vulkan (AMD/Intel) > CPU
+            api.config
+              ?.get('server.gpuAutoDetectDone')
+              .then((done: unknown) => {
+                if (done === true) return; // already ran — respect user's stored choice
+                // Determine best profile for this hardware
+                let detected: RuntimeProfile = 'cpu';
+                if (metalSupported) {
+                  detected = 'metal';
+                } else if (info.gpu && info.toolkit) {
+                  detected = 'gpu';
+                } else if (info.vulkan) {
+                  detected = 'vulkan';
+                }
+                handleRuntimeProfileChange(detected);
+                // If Metal was selected, also set the default MLX model
+                if (detected === 'metal') {
+                  api.config
+                    ?.get('server.mainModelSelection')
+                    .then((modelVal: unknown) => {
+                      const cur = typeof modelVal === 'string' ? modelVal.trim() : '';
+                      if (!cur || cur === MODEL_DEFAULT_LOADING_PLACEHOLDER) {
+                        setMainModelSelection(MLX_DEFAULT_MODEL);
+                        api.config?.set('server.mainModelSelection', MLX_DEFAULT_MODEL);
+                        api.config?.set('server.mainCustomModel', '');
+                      }
+                    })
+                    .catch(() => {});
+                }
+                // Mark auto-detection as done so it never re-runs
+                api.config?.set('server.gpuAutoDetectDone', true);
+              })
+              .catch(() => {});
+          },
+        )
         .catch(() => {
           cachedGpuInfo = null;
           setGpuInfo(null);
         });
     }
   }, []);
+
+  // ─── Manual GPU re-detection ───────────────────────────────────────────────
+  // GH-101 follow-up: lets the user recover after toggling Docker Desktop's
+  // WSL2 ↔ Hyper-V backend (or installing nvidia-container-toolkit) without
+  // restarting Electron. Calls the IPC to clear the main-process caches
+  // (wslDetect single-flight + detectedGpuMode), then re-runs checkGpu() and
+  // updates state. Does NOT re-run the first-run auto-profile pick — that's
+  // a one-shot decision the user has already made by the time this is shown.
+  const [gpuRedetecting, setGpuRedetecting] = useState(false);
+  const handleRedetectGpu = useCallback((): void => {
+    if (gpuRedetecting) return;
+    const api = (window as any).electronAPI;
+    if (!api?.docker?.checkGpu) return;
+    setGpuRedetecting(true);
+    const resetPromise: Promise<void> = api.docker.resetGpuCache
+      ? api.docker.resetGpuCache().catch(() => {})
+      : Promise.resolve();
+    resetPromise
+      .then(() => {
+        cachedGpuInfo = undefined;
+        return api.docker.checkGpu();
+      })
+      .then(
+        (info: {
+          gpu: boolean;
+          toolkit: boolean;
+          vulkan: boolean;
+          wslSupport?: { available: boolean; gpuPassthroughDetected: boolean; reason?: string };
+        }) => {
+          cachedGpuInfo = info;
+          setGpuInfo(info);
+        },
+      )
+      .catch(() => {
+        cachedGpuInfo = null;
+        setGpuInfo(null);
+      })
+      .finally(() => {
+        setGpuRedetecting(false);
+      });
+  }, [gpuRedetecting]);
+
+  // Re-fetch GPU preflight whenever an NVIDIA GPU is detected — including
+  // re-mounts of ServerView where cachedGpuInfo was already populated by
+  // an earlier mount (in which case the GPU-detection effect skips).
+  useEffect(() => {
+    if (!gpuInfo?.gpu) return;
+    const api = (window as any).electronAPI;
+    if (!api?.docker?.validateGpuPreflight) return;
+    api.docker
+      .validateGpuPreflight()
+      .then((p: typeof gpuPreflight) => setGpuPreflight(p))
+      .catch(() => setGpuPreflight(null));
+  }, [gpuInfo?.gpu]);
 
   // Setup checks — gated by the currently selected runtime profile
   const rtName = docker.runtimeKind ?? 'Docker';
@@ -1305,6 +1587,37 @@ export const ServerView: React.FC<ServerViewProps> = ({ onStartServer, startupFl
     });
   }, [docker, keepConfigDirectory, keepDataVolume, keepModelsVolume]);
 
+  // Issue 103: shared by the "Fetch Fresh Image" button and the in-banner
+  // Retry button so a user can re-attempt without re-navigating after a
+  // failure. The activity-store entry tracks the same dlId for both paths.
+  // (Avoid issue-number references with a leading hash in scanned files —
+  //  the UI-contract color regex matches 3-digit hex shorthand and would
+  //  pollute the literal palette.)
+  const handleFetchFreshImage = useCallback(async (): Promise<void> => {
+    if (!selectedTagForActions) return;
+    const dlId = `docker-image-${selectedTagForActions}`;
+    const store = useActivityStore.getState();
+    store.addActivity({
+      id: dlId,
+      category: 'download',
+      label: `Server Image (${selectedTagForActions})`,
+      legacyType: 'docker-image',
+    });
+    try {
+      await docker.pullImage(selectedTagForActions);
+      useActivityStore
+        .getState()
+        .updateActivity(dlId, { status: 'complete', completedAt: Date.now() });
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Pull failed';
+      useActivityStore.getState().updateActivity(dlId, {
+        status: 'error',
+        error: msg,
+        completedAt: Date.now(),
+      });
+    }
+  }, [docker, selectedTagForActions]);
+
   return (
     <>
       <div className="custom-scrollbar h-full w-full overflow-y-auto">
@@ -1323,7 +1636,7 @@ export const ServerView: React.FC<ServerViewProps> = ({ onStartServer, startupFl
           {/* Setup checklist — shown on first run or when prerequisites are missing */}
           {showChecklist && (
             <div
-              className={`overflow-hidden rounded-xl border transition-all duration-300 ${allPassed ? 'border-green-500/20 bg-green-500/5' : 'border-accent-orange/20 bg-accent-orange/5'}`}
+              className={`overflow-hidden rounded-xl border transition-all duration-300 ${allPassed ? 'border-green-500/20 bg-green-500/10' : 'border-accent-orange/20 bg-accent-orange/10'}`}
             >
               <button
                 onClick={() => setSetupExpanded(!setupExpanded)}
@@ -1427,6 +1740,31 @@ export const ServerView: React.FC<ServerViewProps> = ({ onStartServer, startupFl
             </div>
           )}
 
+          {/*
+            GPU Health card (NVIDIA Linux only). Sits adjacent to the setup
+            checklist so all hardware/runtime status is colocated at the top
+            of the wizard. Self-gates: returns null when gpuDetected is false,
+            so the outer Linux + NVIDIA conditional is the authoritative gate.
+            See: dashboard/components/views/GpuHealthCard.tsx
+            Plan:  docs/superpowers/plans/2026-04-29-cuda-error-999-recovery.md
+          */}
+          {hostPlatform === 'linux' && (gpuInfo?.gpu ?? false) && (
+            <GpuHealthCard
+              gpuDetected={true}
+              preflight={gpuPreflight}
+              backendError={gpuBackendError}
+              onRunDiagnostic={handleRunGpuDiagnostic}
+              running={diagnosticRunning}
+              cpuFallbackActive={cpuFallbackActive}
+            />
+          )}
+
+          <GpuDiagnosticModal
+            isOpen={diagnosticOpen}
+            result={diagnosticResult}
+            onClose={handleCloseDiagnostic}
+          />
+
           {/* 1. Docker Image or Inference Server (metal) Card */}
           {runtimeProfile === 'metal' ? (
             <div className="relative shrink-0 border-l-2 border-white/10 pb-8 pl-8 last:border-0 last:pb-0">
@@ -1474,7 +1812,7 @@ export const ServerView: React.FC<ServerViewProps> = ({ onStartServer, startupFl
                   <div className="flex items-center gap-3">
                     <Button
                       variant="secondary"
-                      className="h-9 px-4"
+                      className="h-9 px-4 whitespace-nowrap"
                       onClick={handleMLXStart}
                       disabled={
                         mlxStatus === 'running' ||
@@ -1494,7 +1832,7 @@ export const ServerView: React.FC<ServerViewProps> = ({ onStartServer, startupFl
                     </Button>
                     <Button
                       variant="danger"
-                      className="h-9 px-4"
+                      className="h-9 px-4 whitespace-nowrap"
                       onClick={handleMLXStop}
                       disabled={mlxStatus !== 'running' && mlxStatus !== 'starting'}
                     >
@@ -1526,10 +1864,10 @@ export const ServerView: React.FC<ServerViewProps> = ({ onStartServer, startupFl
               >
                 <div className="grid grid-cols-1 gap-6 md:grid-cols-2">
                   <div className="space-y-4">
-                    <div className="flex items-center space-x-3">
+                    <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
                       <StatusLight status={hasImages ? 'active' : 'inactive'} />
                       <span
-                        className={`font-mono text-sm transition-colors ${hasImages ? 'text-slate-300' : 'text-slate-500'}`}
+                        className={`font-mono text-sm whitespace-nowrap transition-colors ${hasImages ? 'text-slate-300' : 'text-slate-500'}`}
                       >
                         {hasImages
                           ? `${docker.images.length} image${docker.images.length > 1 ? 's' : ''} available`
@@ -1537,12 +1875,12 @@ export const ServerView: React.FC<ServerViewProps> = ({ onStartServer, startupFl
                       </span>
 
                       {hasImages && docker.images[0] && (
-                        <div className="flex gap-2 transition-opacity duration-300">
-                          <span className="rounded bg-white/10 px-2 py-0.5 text-xs text-slate-400">
+                        <div className="flex shrink-0 gap-2 transition-opacity duration-300">
+                          <span className="rounded bg-white/10 px-2 py-0.5 text-xs whitespace-nowrap text-slate-400">
                             {formatDateDMY(docker.images[0].created) ??
                               docker.images[0].created.split(' ')[0]}
                           </span>
-                          <span className="rounded bg-white/10 px-2 py-0.5 text-xs text-slate-400">
+                          <span className="rounded bg-white/10 px-2 py-0.5 text-xs whitespace-nowrap text-slate-400">
                             {docker.images[0].size}
                           </span>
                         </div>
@@ -1579,69 +1917,69 @@ export const ServerView: React.FC<ServerViewProps> = ({ onStartServer, startupFl
                       )}
                     </div>
                   </div>
-                  <div className="flex flex-col justify-end space-y-2">
-                    <Button
-                      variant="secondary"
-                      className="h-10 w-full"
-                      onClick={async () => {
-                        const dlId = `docker-image-${selectedTagForActions}`;
-                        const store = useActivityStore.getState();
-                        store.addActivity({
-                          id: dlId,
-                          category: 'download',
-                          label: `Server Image (${selectedTagForActions})`,
-                          legacyType: 'docker-image',
-                        });
-                        try {
-                          await docker.pullImage(selectedTagForActions);
-                          useActivityStore
-                            .getState()
-                            .updateActivity(dlId, { status: 'complete', completedAt: Date.now() });
-                        } catch (err: unknown) {
-                          const msg = err instanceof Error ? err.message : 'Pull failed';
-                          useActivityStore.getState().updateActivity(dlId, {
-                            status: 'error',
-                            error: msg,
-                            completedAt: Date.now(),
-                          });
-                        }
-                      }}
-                      disabled={docker.operating}
-                    >
-                      {docker.pulling ? (
-                        <>
-                          <Loader2 size={14} className="mr-2 animate-spin" /> Pulling...
-                        </>
-                      ) : (
-                        'Fetch Fresh Image'
+                  <div className="flex flex-col justify-end">
+                    {/*
+                      Give "Fetch Fresh Image" and "Remove Image" a shared width
+                      (the wider of the two labels) and right-align the pair so
+                      they no longer smoosh against the version-tag chips at
+                      narrower window widths. w-max sizes the group to its widest
+                      child; w-full makes both buttons fill that shared width.
+                    */}
+                    <div className="ml-auto flex w-max flex-col gap-2">
+                      <Button
+                        variant="secondary"
+                        className="h-10 w-full"
+                        onClick={handleFetchFreshImage}
+                        disabled={docker.operating}
+                      >
+                        {docker.pulling ? (
+                          <>
+                            <Loader2 size={14} className="mr-2 animate-spin" /> Pulling...
+                          </>
+                        ) : (
+                          'Fetch Fresh Image'
+                        )}
+                      </Button>
+                      {docker.pulling && (
+                        <Button
+                          variant="danger"
+                          className="h-10 w-full"
+                          onClick={() => {
+                            docker.cancelPull();
+                            const dlId = `docker-image-${selectedTagForActions}`;
+                            useActivityStore
+                              .getState()
+                              .updateActivity(dlId, { status: 'dismissed' });
+                          }}
+                        >
+                          Cancel Pull
+                        </Button>
                       )}
-                    </Button>
-                    {docker.pulling && (
                       <Button
                         variant="danger"
                         className="h-10 w-full"
-                        onClick={() => {
-                          docker.cancelPull();
-                          const dlId = `docker-image-${selectedTagForActions}`;
-                          useActivityStore.getState().updateActivity(dlId, { status: 'dismissed' });
-                        }}
+                        onClick={() => docker.removeImage(selectedTagForActions)}
+                        disabled={docker.operating || docker.images.length === 0}
                       >
-                        Cancel Pull
+                        Remove Image
                       </Button>
-                    )}
-                    <Button
-                      variant="danger"
-                      className="h-10 w-full"
-                      onClick={() => docker.removeImage(selectedTagForActions)}
-                      disabled={docker.operating || docker.images.length === 0}
-                    >
-                      Remove Image
-                    </Button>
+                    </div>
                   </div>
                 </div>
                 {docker.operationError && (
-                  <div className="mt-3 rounded-lg border border-red-500/20 bg-red-500/10 px-3 py-2 text-xs text-red-400">
-                    {docker.operationError}
+                  <div className="mt-3 flex items-center justify-between gap-3 rounded-lg border border-red-500/20 bg-red-500/10 px-3 py-2 text-xs text-red-400">
+                    <span className="min-w-0 flex-1">{docker.operationError}</span>
+                    {selectedTagForActions && (
+                      <Button
+                        variant="secondary"
+                        size="sm"
+                        className="shrink-0"
+                        onClick={handleFetchFreshImage}
+                        disabled={docker.operating || docker.pulling}
+                      >
+                        Retry
+                      </Button>
+                    )}
                   </div>
                 )}
                 <div className="mt-4 flex flex-wrap items-center gap-5 border-t border-white/5 pt-4">
@@ -1677,20 +2015,16 @@ export const ServerView: React.FC<ServerViewProps> = ({ onStartServer, startupFl
                     )}
                   </div>
                   <div className="flex min-w-0 flex-1 flex-wrap items-center justify-between gap-4">
-                    <div className="flex gap-2">
+                    <div className="flex flex-wrap gap-2">
                       <Button
                         variant="secondary"
-                        className="h-9 px-4"
+                        className="h-9 px-4 whitespace-nowrap"
                         onClick={() =>
                           onStartServer('local', runtimeProfile, selectedTagForStart, {
                             mainTranscriberModel: sanitizeModelName(activeTranscriber),
                             liveTranscriberModel: sanitizeModelName(normalizedLiveModel),
                             diarizationModel: sanitizeModelName(activeDiarizationModel),
-                            ...(runtimeProfile === 'vulkan'
-                              ? {
-                                  whispercppModel: `/models/${GGML_DISPLAY_TO_ID.get(whispercppModelSelection) ?? 'ggml-large-v3-turbo.bin'}`,
-                                }
-                              : {}),
+                            ...(isVulkan ? { whispercppModel: vulkanSidecarModelPath } : {}),
                           })
                         }
                         disabled={
@@ -1709,17 +2043,13 @@ export const ServerView: React.FC<ServerViewProps> = ({ onStartServer, startupFl
                       </Button>
                       <Button
                         variant="secondary"
-                        className="h-9 px-4"
+                        className="h-9 px-4 whitespace-nowrap"
                         onClick={() =>
                           onStartServer('remote', runtimeProfile, selectedTagForStart, {
                             mainTranscriberModel: sanitizeModelName(activeTranscriber),
                             liveTranscriberModel: sanitizeModelName(normalizedLiveModel),
                             diarizationModel: sanitizeModelName(activeDiarizationModel),
-                            ...(runtimeProfile === 'vulkan'
-                              ? {
-                                  whispercppModel: `/models/${GGML_DISPLAY_TO_ID.get(whispercppModelSelection) ?? 'ggml-large-v3-turbo.bin'}`,
-                                }
-                              : {}),
+                            ...(isVulkan ? { whispercppModel: vulkanSidecarModelPath } : {}),
                           })
                         }
                         disabled={
@@ -1734,7 +2064,7 @@ export const ServerView: React.FC<ServerViewProps> = ({ onStartServer, startupFl
                       </Button>
                       <Button
                         variant="danger"
-                        className="h-9 px-4"
+                        className="h-9 px-4 whitespace-nowrap"
                         onClick={() => docker.stopContainer()}
                         disabled={docker.operating || !isRunning}
                       >
@@ -1743,7 +2073,7 @@ export const ServerView: React.FC<ServerViewProps> = ({ onStartServer, startupFl
                     </div>
                     <Button
                       variant="danger"
-                      className="h-9 px-4"
+                      className="h-9 px-4 whitespace-nowrap"
                       onClick={() => docker.removeContainer()}
                       disabled={docker.operating || isRunning || !containerStatus.exists}
                     >
@@ -1796,6 +2126,24 @@ export const ServerView: React.FC<ServerViewProps> = ({ onStartServer, startupFl
                   <label className="text-xs font-medium tracking-wider whitespace-nowrap text-slate-500 uppercase">
                     Runtime
                   </label>
+                  {/* GH-101 follow-up: re-run GPU detection without restarting
+                      Electron. Hidden until initial detection completes
+                      (gpuInfo !== null) so it never appears in the loading flicker. */}
+                  {gpuInfo !== null && (
+                    <button
+                      type="button"
+                      onClick={handleRedetectGpu}
+                      disabled={gpuRedetecting || isRunning}
+                      title="Re-run GPU detection (use after toggling Docker Desktop's WSL2/Hyper-V backend)"
+                      className={`text-xs whitespace-nowrap underline ${
+                        gpuRedetecting || isRunning
+                          ? 'cursor-not-allowed text-slate-600'
+                          : 'cursor-pointer text-slate-500 hover:text-slate-200'
+                      }`}
+                    >
+                      {gpuRedetecting ? 'Detecting...' : 'Re-detect'}
+                    </button>
+                  )}
                   <div className="flex gap-2">
                     <button
                       onClick={() => handleRuntimeProfileChange('gpu')}
@@ -1822,7 +2170,7 @@ export const ServerView: React.FC<ServerViewProps> = ({ onStartServer, startupFl
                         <AmdIcon size={30} />
                         <IntelIcon size={30} />
                       </span>
-                      GPU (Vulkan)
+                      GPU (Vulkan Linux)
                     </button>
                     <button
                       onClick={() => handleRuntimeProfileChange('metal')}
@@ -1848,10 +2196,41 @@ export const ServerView: React.FC<ServerViewProps> = ({ onStartServer, startupFl
                       <Cpu size={14} />
                       CPU Only
                     </button>
+                    {/* Experimental Vulkan-WSL2 button (GH-101 follow-up) —
+                        only rendered when the dashboard's main-process probe
+                        confirms Docker Desktop is running on the WSL2 backend
+                        AND a tiny container could see /dev/dxg. Sits in-line
+                        with the four-button row to keep selection state
+                        visible at a glance when the profile is active. */}
+                    {gpuInfo?.wslSupport?.gpuPassthroughDetected && hostPlatform === 'win32' && (
+                      <button
+                        onClick={() => handleRuntimeProfileChange('vulkan-wsl2')}
+                        disabled={isRunning}
+                        className={`flex items-center gap-2 rounded-lg border px-4 py-2 text-sm font-medium transition-all ${
+                          runtimeProfile === 'vulkan-wsl2'
+                            ? 'bg-accent-rose/15 border-accent-rose/40 text-accent-rose shadow-[0_0_10px_rgba(244,63,94,0.15)]'
+                            : 'border-white/10 bg-white/5 text-slate-400 hover:bg-white/10 hover:text-slate-200'
+                        } ${isRunning ? 'cursor-not-allowed opacity-50' : 'cursor-pointer'}`}
+                      >
+                        <span className="flex h-5 w-10 flex-col items-center justify-center -space-y-1">
+                          <AmdIcon size={30} />
+                          <IntelIcon size={30} />
+                        </span>
+                        GPU (Vulkan Windows)
+                        <span className="bg-accent-orange/20 text-accent-orange ml-1 rounded px-1.5 py-0.5 text-[10px] font-semibold tracking-wide uppercase">
+                          Exp
+                        </span>
+                      </button>
+                    )}
                   </div>
                   {runtimeProfile === 'vulkan' && !isRunning && (
                     <span className="text-xs text-slate-500 italic">
                       AMD/Intel GPU via whisper.cpp — no diarization or live mode
+                    </span>
+                  )}
+                  {runtimeProfile === 'vulkan-wsl2' && !isRunning && (
+                    <span className="text-accent-orange text-xs italic">
+                      Experimental: AMD/Intel GPU via WSL2 + Mesa dzn — see README §2.5.2
                     </span>
                   )}
                   {runtimeProfile === 'cpu' && !isRunning && (
@@ -2095,35 +2474,11 @@ export const ServerView: React.FC<ServerViewProps> = ({ onStartServer, startupFl
                       className="focus:ring-accent-magenta h-10 w-full rounded-lg border border-white/10 bg-white/5 px-3 text-sm text-white transition-shadow outline-none focus:ring-1"
                       disabled={isRunning}
                     />
-                    {showVulkanModelSuggestion && (
-                      <p className="text-xs text-amber-400">
-                        Vulkan mode works best with GGML models.{' '}
-                        <button
-                          className="underline hover:text-amber-300"
-                          onClick={() => setMainModelSelection(VULKAN_RECOMMENDED_MODEL)}
-                        >
-                          Use {VULKAN_RECOMMENDED_MODEL}
-                        </button>
-                      </p>
-                    )}
-                    {runtimeProfile === 'vulkan' && (
+                    {isVulkan && (
                       <p className="text-xs text-slate-500 italic">
+                        This GGML model runs on the AMD/Intel GPU via the whisper.cpp sidecar.
                         Switching models requires a server restart.
                       </p>
-                    )}
-                    {runtimeProfile === 'vulkan' && (
-                      <div className="space-y-1.5">
-                        <label className="text-xs font-medium text-purple-400">
-                          GGML Sidecar Model
-                        </label>
-                        <CustomSelect
-                          value={whispercppModelSelection}
-                          onChange={setWhispercppModelSelection}
-                          options={GGML_OPTIONS}
-                          className="h-10 w-full rounded-lg border border-white/10 bg-white/5 px-3 text-sm text-white transition-shadow outline-none focus:ring-1 focus:ring-purple-400"
-                          disabled={isRunning}
-                        />
-                      </div>
                     )}
                     {MLX_MODEL_IDS.has(mainModelSelection) && (
                       <p className="flex items-center gap-1 text-xs text-violet-400">
@@ -2194,7 +2549,7 @@ export const ServerView: React.FC<ServerViewProps> = ({ onStartServer, startupFl
                 <div className="flex gap-2 border-t border-white/5 pt-2">
                   <Button
                     variant={adminStatus?.models_loaded === false ? 'secondary' : 'danger'}
-                    className="h-9 px-4"
+                    className="h-9 px-4 whitespace-nowrap"
                     onClick={
                       adminStatus?.models_loaded === false ? handleLoadModels : handleUnloadModels
                     }
@@ -2249,14 +2604,17 @@ export const ServerView: React.FC<ServerViewProps> = ({ onStartServer, startupFl
                 <CustomSelect
                   value={diarizationModelSelection}
                   onChange={setDiarizationModelSelection}
-                  options={[
-                    DIARIZATION_SORTFORMER_OPTION,
-                    DIARIZATION_DEFAULT_MODEL,
-                    DIARIZATION_MODEL_CUSTOM_OPTION,
-                  ]}
+                  options={diarizationOptions}
                   className="focus:ring-accent-cyan h-10 w-full rounded-lg border border-white/10 bg-white/5 px-3 text-sm text-white transition-shadow outline-none focus:ring-1"
                   disabled={isRunning}
                 />
+                {isMetal && (
+                  <p className="text-xs text-slate-500 italic">
+                    Pyannote diarization is not supported on Apple Silicon (pyannote.audio MPS path
+                    is broken upstream — see pyannote/pyannote-audio#1886). Sortformer (Metal) is
+                    the recommended diarizer on Mac.
+                  </p>
+                )}
                 {diarizationModelSelection === DIARIZATION_MODEL_CUSTOM_OPTION && (
                   <input
                     type="text"
@@ -2267,6 +2625,17 @@ export const ServerView: React.FC<ServerViewProps> = ({ onStartServer, startupFl
                     className={`focus:ring-accent-cyan h-10 w-full rounded-lg border border-white/10 bg-white/5 px-3 text-sm text-white placeholder-slate-500 transition-shadow outline-none focus:ring-1${isRunning ? 'cursor-not-allowed opacity-50' : ''}`}
                   />
                 )}
+                {isMetal &&
+                  diarizationModelSelection === DIARIZATION_MODEL_CUSTOM_OPTION &&
+                  PYANNOTE_REPO_PATTERN.test(diarizationCustomModel.trim()) && (
+                    <div className="flex items-start gap-2 rounded-lg border border-amber-500/20 bg-amber-500/10 px-3 py-2 text-xs text-amber-300">
+                      <AlertTriangle size={14} className="mt-0.5 shrink-0" />
+                      <span>
+                        Custom pyannote repos are not supported on Apple Silicon — switch to
+                        Sortformer.
+                      </span>
+                    </div>
+                  )}
               </div>
             </GlassCard>
           </div>
@@ -2303,17 +2672,38 @@ export const ServerView: React.FC<ServerViewProps> = ({ onStartServer, startupFl
                         color: 'bg-purple-500',
                       },
                     ].map(({ label, path: dir, color }) => (
-                      <div key={label} className="flex items-center justify-between py-1 text-sm">
-                        <div className="flex items-center gap-3">
-                          <div className={`h-2 w-2 rounded-full ${color}`} />
-                          <span className="text-slate-300">{label}</span>
+                      <div key={label} className="py-1 text-sm">
+                        <div className="flex items-center justify-between gap-2">
+                          <div className="flex items-center gap-3">
+                            <div className={`h-2 w-2 rounded-full ${color}`} />
+                            <span className="text-slate-300">{label}</span>
+                          </div>
+                          <div className="flex shrink-0 items-center gap-1">
+                            <button
+                              onClick={() => handleOpenNativePath(dir)}
+                              disabled={!dir}
+                              className="rounded p-1 text-slate-500 transition-colors hover:bg-white/10 hover:text-white disabled:cursor-not-allowed disabled:opacity-40"
+                              title="Open in file manager"
+                            >
+                              <FolderOpen size={14} />
+                            </button>
+                            <button
+                              onClick={() => handleCopyNativePath(dir, label)}
+                              disabled={!dir}
+                              className="rounded p-1 text-slate-500 transition-colors hover:bg-white/10 hover:text-white disabled:cursor-not-allowed disabled:opacity-40"
+                              title="Copy path"
+                            >
+                              {copiedPath === label ? (
+                                <Check size={14} className="text-green-400" />
+                              ) : (
+                                <Copy size={14} />
+                              )}
+                            </button>
+                          </div>
                         </div>
-                        <span
-                          className="max-w-[55%] truncate text-right font-mono text-xs text-slate-400"
-                          title={dir ?? ''}
-                        >
+                        <div className="mt-1 pl-5 font-mono text-xs break-all text-slate-400">
                           {dir ?? '…'}
-                        </span>
+                        </div>
                       </div>
                     ))}
                     <p className="text-xs text-slate-500 italic">
@@ -2418,7 +2808,7 @@ export const ServerView: React.FC<ServerViewProps> = ({ onStartServer, startupFl
       >
         <div className="fixed inset-0 bg-black/70 backdrop-blur-sm" aria-hidden="true" />
         <div className="fixed inset-0 flex items-center justify-center p-4">
-          <DialogPanel className="w-full max-w-lg overflow-hidden rounded-3xl border border-red-500/25 bg-black/75 shadow-2xl backdrop-blur-xl">
+          <DialogPanel className="blur-panel w-full max-w-lg overflow-hidden rounded-3xl border border-red-500/25 bg-black/75 shadow-2xl backdrop-blur-xl">
             <div className="border-b border-red-500/20 bg-red-500/10 px-6 py-4">
               <DialogTitle className="text-lg font-semibold text-red-100">Clean All</DialogTitle>
               <p className="mt-1 text-sm text-red-200/90">
@@ -2511,7 +2901,7 @@ export const ServerView: React.FC<ServerViewProps> = ({ onStartServer, startupFl
       >
         <div className="fixed inset-0 bg-black/70 backdrop-blur-sm" aria-hidden="true" />
         <div className="fixed inset-0 flex items-center justify-center p-4">
-          <DialogPanel className="border-accent-orange/25 w-full max-w-lg overflow-hidden rounded-3xl border bg-black/75 shadow-2xl backdrop-blur-xl">
+          <DialogPanel className="border-accent-orange/25 blur-panel w-full max-w-lg overflow-hidden rounded-3xl border bg-black/75 shadow-2xl backdrop-blur-xl">
             <div className="border-accent-orange/20 bg-accent-orange/10 border-b px-6 py-4">
               <DialogTitle className="text-accent-orange text-lg font-semibold">
                 {pendingLegacyGpuValue ? 'Enable legacy-GPU image?' : 'Disable legacy-GPU image?'}
@@ -2577,6 +2967,10 @@ export const ServerView: React.FC<ServerViewProps> = ({ onStartServer, startupFl
                   // remain correct even if the user dismisses via Escape.
                   setLegacyGpuDialogOpen(false);
                   setPendingLegacyGpuValue(null);
+                  // GH-99: clear stale remote-tag chips synchronously so the
+                  // user doesn't see default-repo tags while the legacy repo
+                  // is being queried (the IPC + refetch takes ~1-2s).
+                  docker.clearRemoteTags?.();
                   api.server
                     .setUseLegacyGpu(next, legacyGpuWipeVolume)
                     .then(
@@ -2586,6 +2980,10 @@ export const ServerView: React.FC<ServerViewProps> = ({ onStartServer, startupFl
                         runtimeVolumeWipeError: string | null;
                       }) => {
                         setUseLegacyGpu(next);
+                        // GH-99: re-fetch against the now-active variant's
+                        // GHCR repo. Fire-and-forget — refresh errors surface
+                        // through the existing `remoteTagsStatus` channel.
+                        void docker.refreshRemoteTags?.();
                         const base = `${next ? 'Enabled' : 'Disabled'} legacy-GPU image. `;
                         if (legacyGpuWipeVolume && !result.runtimeVolumeWiped) {
                           // Wipe was requested but failed — tell the user so

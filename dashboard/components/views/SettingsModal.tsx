@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import {
   X,
   ChevronDown,
@@ -22,6 +22,7 @@ import {
   Send,
   Cpu,
   Bot,
+  Layers,
 } from 'lucide-react';
 import { Button } from '../ui/Button';
 import { AppleSwitch } from '../ui/AppleSwitch';
@@ -36,6 +37,8 @@ import { useConfirm } from '../../src/hooks/useConfirm';
 import { isMLXModel, isVibeVoiceASRModel } from '../../src/services/modelCapabilities';
 import { mergeConfigUpdates } from '../../src/utils/configTree';
 import { DEFAULT_SERVER_PORT } from '../../src/config/store';
+import { readPersistedBlurEffects } from '../../src/utils/blurEffectsBoot';
+import { readPersistedIdleAnimations } from '../../src/utils/idleAnimationsBoot';
 import type { AuthToken, LLMModel } from '../../src/api/types';
 import { useAdminStatus } from '../../src/hooks/useAdminStatus';
 import { ServerConfigEditor } from './ServerConfigEditor';
@@ -44,13 +47,19 @@ import { AmdIcon } from '../ui/icons/AmdIcon';
 import { IntelIcon } from '../ui/icons/IntelIcon';
 import { AppleIcon } from '../ui/icons/AppleIcon';
 import type { RuntimeProfile } from '../../src/types/runtime';
+import type { Profile } from '../../src/api/client';
+import { EmptyProfileForm } from '../profiles/EmptyProfileForm';
+import { ModelProfilesPanel } from '../profiles/ModelProfilesPanel';
+import { useLanguages } from '../../src/hooks/useLanguages';
+import { MAIN_MODEL_PRESETS } from '../../src/services/modelSelection';
+import { CANARY_TRANSLATION_TARGETS } from '../../src/services/modelCapabilities';
 
 interface SettingsModalProps {
   isOpen: boolean;
   onClose: () => void;
 }
 
-const tabs = ['App', 'Client', 'Server', 'AI', 'Notebook'];
+const tabs = ['App', 'Client', 'Server', 'AI', 'Notebook', 'Profiles'];
 const DEFAULT_SHORTCUTS = {
   startRecording: 'Alt+Ctrl+Z',
   stopTranscribe: 'Alt+Ctrl+X',
@@ -109,6 +118,33 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose })
   const [configDir, setConfigDir] = useState<string>('~/.config/TranscriptionSuite');
   const [platform, setPlatform] = useState('');
   const [sessionType, setSessionType] = useState('');
+  // GPU/WSL2 detection result — used to gate the experimental Vulkan-WSL2
+  // runtime profile button on Windows + Docker Desktop with WSL2 backend
+  // (GH-101 follow-up). `undefined` while the modal is loading or if the
+  // last probe rejected; the button is gated on
+  // `gpuInfo?.wslSupport?.gpuPassthroughDetected === true`, so transient
+  // failures simply hide the button rather than misrepresenting state.
+  // The main-process probe is single-flight cached, so reopening the modal
+  // hits the cache without re-probing Docker.
+  const [gpuInfo, setGpuInfo] = useState<
+    | {
+        gpu: boolean;
+        toolkit: boolean;
+        vulkan: boolean;
+        wslSupport?: { available: boolean; gpuPassthroughDetected: boolean; reason?: string };
+      }
+    | undefined
+  >(undefined);
+
+  // Profiles tab state — recording (post-transcription) profiles list, fetch
+  // status, and the "creating new" toggle that mounts EmptyProfileForm.
+  // Story 1.5/1.6 wiring (Issue #104). Model profiles are managed by
+  // ModelProfilesPanel itself (electron-store backed, no shared state here).
+  const [recordingProfiles, setRecordingProfiles] = useState<Profile[]>([]);
+  const [profilesLoading, setProfilesLoading] = useState<boolean>(false);
+  const [creatingRecordingProfile, setCreatingRecordingProfile] = useState<boolean>(false);
+  const [profileError, setProfileError] = useState<string | null>(null);
+  const { languages: sttLanguages } = useLanguages(null);
 
   // Token management state
   const [tokens, setTokens] = useState<AuthToken[]>([]);
@@ -147,7 +183,28 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose })
     updateCheckCustomHours: 24,
     runtimeProfile: 'cpu' as RuntimeProfile,
     pasteAtCursor: false,
+    blurEffectsEnabled: true,
+    idleAnimationsEnabled: true,
   });
+  // Issue #87 — track the LAST SAVED Blur effects value so we can revert any
+  // unsaved live-preview DOM changes if the modal closes via X without Save.
+  // Lazy-initialised from the same localStorage source the boot probe in
+  // dashboard/index.tsx reads, so the ref agrees with the attribute the boot
+  // probe actually applied. Without this, the load effect close branch would
+  // fire on initial component mount (the modal is unconditionally rendered
+  // by App.tsx with isOpen=false) and incorrectly remove the boot probe DOM
+  // attribute, re-enabling blur for users who have disabled it. Updated in
+  // the load effect (when reading from config) and in handleSave (after the
+  // persisted write). The toggle onChange applies the change to the DOM
+  // immediately for live preview; this ref is the rollback target.
+  const savedBlurEffectsRef = useRef<boolean>(readPersistedBlurEffects());
+  // GH-87 — track the LAST SAVED Idle animations value so we can revert any
+  // unsaved live-preview DOM change if the modal closes via X without Save.
+  // Lazy-initialised from the same localStorage source the boot probe in
+  // dashboard/index.tsx reads (default ON), so the ref agrees with the
+  // attribute the boot probe actually applied. Same rollback-target role as
+  // savedBlurEffectsRef; updated in the load effect and in handleSave.
+  const savedIdleAnimationsRef = useRef<boolean>(readPersistedIdleAnimations());
   const [shortcutSettings, setShortcutSettings] = useState<{
     startRecording: string;
     stopTranscribe: string;
@@ -283,6 +340,18 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose })
         // Detect platform and session type for conditional UI hints
         setPlatform(api.app?.getPlatform?.() ?? '');
         setSessionType(api.app?.getSessionType?.() ?? '');
+        // Probe for WSL2 + GPU paravirtualization on Win32 to decide whether
+        // to surface the experimental Vulkan-WSL2 runtime profile button
+        // (GH-101 follow-up). Cached single-flight at the main-process level,
+        // so this is cheap on subsequent opens.
+        api.docker
+          ?.checkGpu?.()
+          .then((info: typeof gpuInfo) => {
+            setGpuInfo(info);
+          })
+          .catch(() => {
+            setGpuInfo(undefined);
+          });
 
         // Load config directory path
         api.app
@@ -316,6 +385,11 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose })
                 hfToken: (cfg['server.hfToken'] as string) ?? prev.hfToken,
                 hideTimestamps: (cfg['output.hideTimestamps'] as boolean) ?? prev.hideTimestamps,
               }));
+              const loadedBlurEffectsEnabled = (cfg['ui.blurEffectsEnabled'] as boolean) ?? true;
+              savedBlurEffectsRef.current = loadedBlurEffectsEnabled;
+              const loadedIdleAnimationsEnabled =
+                (cfg['ui.idleAnimationsEnabled'] as boolean) ?? true;
+              savedIdleAnimationsRef.current = loadedIdleAnimationsEnabled;
               setAppSettings((prev) => ({
                 ...prev,
                 autoCopy: (cfg['app.autoCopy'] as boolean) ?? prev.autoCopy,
@@ -332,6 +406,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose })
                 runtimeProfile:
                   (cfg['server.runtimeProfile'] as RuntimeProfile) ?? prev.runtimeProfile,
                 pasteAtCursor: (cfg['app.pasteAtCursor'] as boolean) ?? prev.pasteAtCursor,
+                blurEffectsEnabled: loadedBlurEffectsEnabled,
+                idleAnimationsEnabled: loadedIdleAnimationsEnabled,
               }));
               setShortcutSettings((prev) => ({
                 ...prev,
@@ -377,6 +453,25 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose })
     } else {
       setIsVisible(false);
       timer = setTimeout(() => setIsRendered(false), 300);
+      // Issue #87 — revert any unsaved live-preview Blur effects DOM change
+      // back to the last-saved baseline. After Save, savedBlurEffectsRef
+      // matches the new state so this revert is a no-op; after close via X
+      // it restores the visible state to the actually-persisted choice.
+      if (savedBlurEffectsRef.current) {
+        delete document.documentElement.dataset.blurEffects;
+      } else {
+        document.documentElement.dataset.blurEffects = 'off';
+      }
+      // GH-87 — revert any unsaved live-preview Idle animations DOM change back
+      // to the last-saved baseline. After Save the ref matches the new state so
+      // this revert is a no-op; after close via X it restores the visible state
+      // to the actually-persisted choice. Polarity mirrors blur: ON = no
+      // attribute (animations play), OFF = data-idle-animations="off".
+      if (savedIdleAnimationsRef.current) {
+        delete document.documentElement.dataset.idleAnimations;
+      } else {
+        document.documentElement.dataset.idleAnimations = 'off';
+      }
     }
     // Subscribe to portal shortcut changes
     let unsubPortal: (() => void) | undefined;
@@ -446,11 +541,43 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose })
         ['app.updateCheckCustomHours', appSettings.updateCheckCustomHours],
         ['server.runtimeProfile', appSettings.runtimeProfile],
         ['app.pasteAtCursor', appSettings.pasteAtCursor],
+        ['ui.blurEffectsEnabled', appSettings.blurEffectsEnabled],
+        ['ui.idleAnimationsEnabled', appSettings.idleAnimationsEnabled],
         ['shortcuts.startRecording', shortcutSettings.startRecording.trim()],
         ['shortcuts.stopTranscribe', shortcutSettings.stopTranscribe.trim()],
       ];
       await Promise.all(entries.map(([k, v]) => api.config.set(k, v)));
     }
+
+    // Issue #87 — Mirror the Blur effects choice to localStorage so the
+    // synchronous bootstrap probe in `dashboard/index.tsx` can read it
+    // before first render on next launch (electron-store is async via IPC).
+    // Without this, a user who has just turned blur OFF would still see a
+    // flash-of-blur on the next cold start.
+    try {
+      localStorage.setItem(
+        'ts-config:ui.blurEffectsEnabled',
+        JSON.stringify(appSettings.blurEffectsEnabled),
+      );
+    } catch {
+      // Non-fatal — electron-store remains the canonical source of truth.
+    }
+    savedBlurEffectsRef.current = appSettings.blurEffectsEnabled;
+
+    // GH-87 — Mirror the Idle animations choice to localStorage so the
+    // synchronous bootstrap probe in `dashboard/index.tsx` can read it before
+    // first render on next launch (electron-store is async via IPC). Without
+    // this, a user who has just turned animations OFF would briefly see the
+    // animating idle waves on the next cold start.
+    try {
+      localStorage.setItem(
+        'ts-config:ui.idleAnimationsEnabled',
+        JSON.stringify(appSettings.idleAnimationsEnabled),
+      );
+    } catch {
+      // Non-fatal — electron-store remains the canonical source of truth.
+    }
+    savedIdleAnimationsRef.current = appSettings.idleAnimationsEnabled;
 
     // Sync API client with new config so connection target updates immediately
     await apiClient.syncFromConfig();
@@ -489,6 +616,85 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose })
     setServerConfigUpdates((prev) => ({ ...prev, [path]: value }));
     setIsDirty(true);
   }, []);
+
+  // Recording-profiles fetch — runs whenever the Profiles tab becomes active
+  // and when a profile is created/deleted (refreshKey bump). Failures surface
+  // inline (profileError) rather than throwing — the user can retry by
+  // re-opening the tab.
+  useEffect(() => {
+    if (activeTab !== 'Profiles') return;
+    let cancelled = false;
+    setProfilesLoading(true);
+    setProfileError(null);
+    void apiClient
+      .listProfiles()
+      .then((list) => {
+        if (!cancelled) setRecordingProfiles(list);
+      })
+      .catch((err: unknown) => {
+        if (cancelled) return;
+        setProfileError(err instanceof Error ? err.message : 'Failed to load profiles');
+      })
+      .finally(() => {
+        if (!cancelled) setProfilesLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [activeTab]);
+
+  const refreshRecordingProfiles = useCallback(async () => {
+    setProfilesLoading(true);
+    setProfileError(null);
+    try {
+      const list = await apiClient.listProfiles();
+      setRecordingProfiles(list);
+    } catch (err: unknown) {
+      setProfileError(err instanceof Error ? err.message : 'Failed to load profiles');
+    } finally {
+      setProfilesLoading(false);
+    }
+  }, []);
+
+  const handleDeleteRecordingProfile = useCallback(
+    async (profile: Profile) => {
+      const ok = await confirm(
+        `Delete profile "${profile.name}"? Existing transcriptions are unaffected — only future jobs lose this preset.`,
+        { danger: true, confirmLabel: 'Delete' },
+      );
+      if (!ok) return;
+      try {
+        await apiClient.deleteProfile(profile.id);
+        toast.success(`Deleted "${profile.name}"`);
+        await refreshRecordingProfiles();
+      } catch (err: unknown) {
+        toast.error(err instanceof Error ? err.message : 'Delete failed');
+      }
+    },
+    [confirm, refreshRecordingProfiles],
+  );
+
+  // Translation targets list — Canary supports translation to a fixed set of
+  // EU target languages; we surface those by intersecting with the languages
+  // list returned by the server (which has display names) so the dropdown
+  // reads "German" rather than "de".
+  const translationTargetOptions = React.useMemo(() => {
+    const codes = new Set<string>(CANARY_TRANSLATION_TARGETS);
+    return sttLanguages
+      .filter((l) => codes.has(l.code))
+      .map((l) => ({ code: l.code, label: l.name }));
+  }, [sttLanguages]);
+
+  const availableLanguageOptions = React.useMemo(
+    () =>
+      sttLanguages.filter((l) => l.code !== 'auto').map((l) => ({ code: l.code, label: l.name })),
+    [sttLanguages],
+  );
+
+  const availableModelOptions = React.useMemo(
+    () => MAIN_MODEL_PRESETS.map((id) => ({ id, label: id })),
+    [],
+  );
 
   if (!isRendered) return null;
 
@@ -622,14 +828,42 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose })
               CPU Only
             </button>
           </div>
+          {/* Experimental Vulkan-WSL2 button (GH-101 follow-up) — only shown
+              when Docker Desktop's WSL2 backend + /dev/dxg passthrough are
+              both detected. Lives on its own row so the four-tile main row
+              stays compact and the "experimental" framing is unambiguous. */}
+          {gpuInfo?.wslSupport?.gpuPassthroughDetected && platform === 'win32' && (
+            <button
+              onClick={() => {
+                setAppSettings((prev) => ({ ...prev, runtimeProfile: 'vulkan-wsl2' }));
+                setIsDirty(true);
+              }}
+              className={`flex w-full items-center justify-center gap-2 rounded-lg border px-4 py-3 text-sm font-medium transition-all ${
+                appSettings.runtimeProfile === 'vulkan-wsl2'
+                  ? 'bg-accent-rose/15 border-accent-rose/40 text-accent-rose'
+                  : 'border-white/10 bg-white/5 text-slate-400 hover:bg-white/10'
+              }`}
+            >
+              <span className="flex h-5 w-10 flex-col items-center justify-center -space-y-1">
+                <AmdIcon size={30} />
+                <IntelIcon size={30} />
+              </span>
+              GPU (Vulkan WSL2)
+              <span className="bg-accent-orange/20 text-accent-orange ml-2 rounded px-1.5 py-0.5 text-[10px] font-semibold tracking-wide uppercase">
+                Experimental
+              </span>
+            </button>
+          )}
           <p className="text-xs text-slate-500 italic">
             {appSettings.runtimeProfile === 'vulkan'
               ? 'Vulkan mode: Uses whisper.cpp for AMD/Intel GPU acceleration. Requires a GGML model and /dev/dri access. No diarization or live mode.'
-              : appSettings.runtimeProfile === 'cpu'
-                ? 'CPU mode: No GPU required. Works on macOS, Linux, and Windows. Expect slower transcription speeds.'
-                : appSettings.runtimeProfile === 'metal'
-                  ? 'Metal mode: Apple Silicon MLX acceleration. Recommended for M-series Macs running bare-metal.'
-                  : 'GPU mode: Requires NVIDIA GPU with CUDA. Recommended for Linux and Windows with supported hardware.'}
+              : appSettings.runtimeProfile === 'vulkan-wsl2'
+                ? 'Vulkan WSL2 (experimental): AMD/Intel GPU acceleration on Windows + Docker Desktop with WSL2 backend, via Mesa dzn (Vulkan-on-D3D12). Requires the locally-built sidecar image — see README §2.5 for build steps. May silently fall back to CPU rasterizer if dzn cannot enumerate /dev/dxg.'
+                : appSettings.runtimeProfile === 'cpu'
+                  ? 'CPU mode: No GPU required. Works on macOS, Linux, and Windows. Expect slower transcription speeds.'
+                  : appSettings.runtimeProfile === 'metal'
+                    ? 'Metal mode: Apple Silicon MLX acceleration. Recommended for M-series Macs running bare-metal.'
+                    : 'GPU mode: Requires NVIDIA GPU with CUDA. Recommended for Linux and Windows with supported hardware.'}
           </p>
           {appSettings.runtimeProfile === 'metal' && adminStatus !== null && !metalSupported && (
             <p className="text-xs text-red-400">
@@ -640,6 +874,36 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose })
                   : 'Metal (MLX) is not available on this machine. Select a different runtime.'}
             </p>
           )}
+          {appSettings.runtimeProfile === 'vulkan' && platform && platform !== 'linux' && (
+            <p className="text-xs text-red-400">
+              Vulkan requires Linux — Docker Desktop on Windows/macOS has no{' '}
+              <span className="font-mono">/dev/dri</span> GPU passthrough.{' '}
+              {platform === 'win32' && gpuInfo?.wslSupport?.gpuPassthroughDetected
+                ? 'Try the experimental "GPU (Vulkan WSL2)" profile below, or '
+                : 'Select '}
+              CPU
+              {platform === 'win32'
+                ? ', or GPU (CUDA) if you have NVIDIA hardware'
+                : platform === 'darwin'
+                  ? ', GPU (Metal) on Apple Silicon, or GPU (CUDA) if you dual-boot with NVIDIA hardware'
+                  : ''}
+              .
+            </p>
+          )}
+          {appSettings.runtimeProfile === 'vulkan-wsl2' && platform !== 'win32' && (
+            <p className="text-xs text-red-400">
+              The Vulkan WSL2 profile only applies to Windows + Docker Desktop with the WSL2
+              backend. Switch to {platform === 'linux' ? '"GPU (Vulkan)"' : 'CPU or GPU (Metal)'}.
+            </p>
+          )}
+          {appSettings.runtimeProfile === 'vulkan-wsl2' &&
+            platform === 'win32' &&
+            !gpuInfo?.wslSupport?.gpuPassthroughDetected && (
+              <p className="text-xs text-red-400">
+                {gpuInfo?.wslSupport?.reason ??
+                  'WSL2 GPU passthrough was not detected — make sure Docker Desktop is running with the WSL2 backend and your Windows GPU driver is current.'}
+              </p>
+            )}
         </div>
       </Section>
       <Section title="Window">
@@ -650,6 +914,45 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose })
             setIsDirty(true);
           }}
           label="Start minimized to system tray"
+        />
+      </Section>
+      <Section title="Appearance">
+        <AppleSwitch
+          checked={appSettings.blurEffectsEnabled}
+          onChange={(v) => {
+            setAppSettings((prev) => ({ ...prev, blurEffectsEnabled: v }));
+            setIsDirty(true);
+            // Live preview — apply the DOM attribute immediately so the user
+            // sees the effect before clicking Save. If they close via X
+            // without saving, the load-effect close branch reverts to the
+            // last-saved baseline tracked by `savedBlurEffectsRef`.
+            if (v) {
+              delete document.documentElement.dataset.blurEffects;
+            } else {
+              document.documentElement.dataset.blurEffects = 'off';
+            }
+          }}
+          label="Blur effects"
+          description="Disable backdrop blur to reduce CPU/GPU usage. May help on older Mac, Linux, or low-power devices."
+        />
+        <AppleSwitch
+          checked={appSettings.idleAnimationsEnabled}
+          onChange={(v) => {
+            setAppSettings((prev) => ({ ...prev, idleAnimationsEnabled: v }));
+            setIsDirty(true);
+            // Live preview — apply the DOM attribute immediately so the user
+            // sees the effect before clicking Save. If they close via X
+            // without saving, the load-effect close branch reverts to the
+            // last-saved baseline tracked by `savedIdleAnimationsRef`. Polarity
+            // mirrors blur: ON = no attribute (waves animate), OFF = attribute set.
+            if (v) {
+              delete document.documentElement.dataset.idleAnimations;
+            } else {
+              document.documentElement.dataset.idleAnimations = 'off';
+            }
+          }}
+          label="Idle animations"
+          description="Stop the idle audio-visualizer animations to cut idle CPU/GPU. Recommended on laptops and Apple Silicon Macs."
         />
       </Section>
       <Section title="Keyboard Shortcuts">
@@ -1841,6 +2144,100 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose })
     </div>
   );
 
+  const renderProfilesTab = () => (
+    <div className="space-y-6">
+      <Section title="Recording Profiles">
+        <p className="mb-2 text-xs text-slate-400">
+          Group filename template, destination folder, and auto-actions into a named profile. The
+          active profile is snapshotted at job start — edits do not affect running jobs.
+        </p>
+
+        {profileError !== null && (
+          <div role="alert" className="rounded bg-red-500/10 px-3 py-2 text-xs text-red-300">
+            {profileError}
+          </div>
+        )}
+
+        {profilesLoading ? (
+          <div className="flex items-center gap-2 text-sm text-slate-400" aria-live="polite">
+            <Loader2 size={14} className="animate-spin" />
+            Loading profiles…
+          </div>
+        ) : (
+          <ul className="flex flex-col gap-2" aria-label="Existing recording profiles">
+            {recordingProfiles.length === 0 && !creatingRecordingProfile && (
+              <li className="text-xs text-slate-500">
+                No profiles yet. Click "New profile" below to create one with sane defaults.
+              </li>
+            )}
+            {recordingProfiles.map((p) => (
+              <li
+                key={p.id}
+                className="flex items-center justify-between rounded bg-white/5 px-3 py-2 text-sm"
+              >
+                <div className="flex flex-col">
+                  <span className="font-medium text-slate-100">{p.name}</span>
+                  {p.description !== null && p.description !== '' && (
+                    <span className="text-xs text-slate-400">{p.description}</span>
+                  )}
+                  <span className="font-mono text-xs text-slate-500">
+                    {p.public_fields.filename_template}
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => void handleDeleteRecordingProfile(p)}
+                  aria-label={`Delete profile "${p.name}"`}
+                  className="rounded bg-red-500/20 px-2 py-1 text-xs text-red-200 hover:bg-red-500/30"
+                >
+                  <Trash2 size={12} className="inline" /> Delete
+                </button>
+              </li>
+            ))}
+          </ul>
+        )}
+
+        {!creatingRecordingProfile && (
+          <div className="pt-2">
+            <Button
+              variant="primary"
+              size="sm"
+              icon={<Plus size={14} />}
+              onClick={() => setCreatingRecordingProfile(true)}
+            >
+              New profile
+            </Button>
+          </div>
+        )}
+
+        {creatingRecordingProfile && (
+          <div className="mt-3 rounded-lg border border-white/10 bg-white/5">
+            <EmptyProfileForm
+              onCreated={async () => {
+                setCreatingRecordingProfile(false);
+                await refreshRecordingProfiles();
+                toast.success('Profile created');
+              }}
+              onCancel={() => setCreatingRecordingProfile(false)}
+            />
+          </div>
+        )}
+      </Section>
+
+      <Section title="Model Profiles">
+        <p className="mb-2 text-xs text-slate-400">
+          Save STT-model + language combinations and switch between them in one click from the
+          sidebar selector. Independent of recording profiles (FR42).
+        </p>
+        <ModelProfilesPanel
+          availableModels={availableModelOptions}
+          availableLanguages={availableLanguageOptions}
+          translationTargets={translationTargetOptions}
+        />
+      </Section>
+    </div>
+  );
+
   const getIconForTab = (tab: string) => {
     switch (tab) {
       case 'App':
@@ -1853,6 +2250,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose })
         return <Database size={16} />;
       case 'AI':
         return <Bot size={16} />;
+      case 'Profiles':
+        return <Layers size={16} />;
       default:
         return null;
     }
@@ -1870,7 +2269,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose })
 
         {/* Modal Window */}
         <div
-          className={`bg-glass-surface border-glass-border relative flex h-[85vh] w-full max-w-3xl flex-col overflow-hidden rounded-2xl border shadow-2xl backdrop-blur-xl transition-all duration-300 ease-[cubic-bezier(0.32,0.72,0,1)] ${isVisible ? 'translate-y-0 opacity-100' : 'translate-y-full opacity-0'} `}
+          className={`blur-panel bg-glass-surface border-glass-border relative flex h-[85vh] w-full max-w-3xl flex-col overflow-hidden rounded-2xl border shadow-2xl backdrop-blur-xl transition-all duration-300 ease-[cubic-bezier(0.32,0.72,0,1)] ${isVisible ? 'translate-y-0 opacity-100' : 'translate-y-full opacity-0'} `}
         >
           {/* Header */}
           <div className="flex flex-none items-center justify-between border-b border-white/10 bg-white/5 px-6 py-4 select-none">
@@ -1909,6 +2308,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose })
               {activeTab === 'Server' && renderServerTab()}
               {activeTab === 'AI' && renderAITab()}
               {activeTab === 'Notebook' && renderNotebookTab()}
+              {activeTab === 'Profiles' && renderProfilesTab()}
             </div>
           </div>
 

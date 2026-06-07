@@ -17,6 +17,10 @@ import {
 import logoUrl from '../../docs/assets/logo.png';
 import { StatusLight } from './ui/StatusLight';
 import type { RuntimeProfile } from '../src/types/runtime';
+import { ProfileSelector } from './profiles/ProfileSelector';
+import { ModelProfileSelector } from './profiles/ModelProfileSelector';
+import type { ModelProfile } from '../src/services/modelProfileStore';
+import { toast } from 'sonner';
 
 interface SidebarProps {
   currentView: View;
@@ -36,6 +40,15 @@ interface SidebarProps {
   runtimeProfile?: RuntimeProfile;
   serverReachable?: boolean;
   mlxProcessAlive?: boolean;
+  /** True while live mode is engaged — model swaps are blocked in this state. */
+  liveModeActive?: boolean;
+  /**
+   * Caller-supplied model swap. Receives the selected model profile and is
+   * expected to drive model_manager.load_transcription_model via the
+   * existing `server.mainModelSelection` config path. Resolve when the
+   * server has been notified; the selector keeps the spinner up until then.
+   */
+  onSwitchModelProfile?: (profile: ModelProfile) => Promise<void>;
 }
 
 const SIDEBAR_COLLAPSED_WIDTH_PX = 80;
@@ -61,6 +74,8 @@ export const Sidebar: React.FC<SidebarProps> = ({
   runtimeProfile,
   serverReachable,
   mlxProcessAlive,
+  liveModeActive = false,
+  onSwitchModelProfile,
 }) => {
   const isMetal = runtimeProfile === 'metal';
   const [collapsed, setCollapsed] = useState(false);
@@ -216,12 +231,20 @@ export const Sidebar: React.FC<SidebarProps> = ({
 
   return (
     <div
-      className={`bg-glass-surface border-glass-border relative flex h-full shrink-0 flex-col border-r backdrop-blur-2xl transition-all duration-300 ease-[cubic-bezier(0.25,0.1,0.25,1)] ${collapsed ? 'w-20' : 'w-48'} `}
+      className={`blur-panel bg-glass-surface border-glass-border relative z-30 flex h-full shrink-0 flex-col border-r backdrop-blur-2xl transition-all duration-300 ease-[cubic-bezier(0.25,0.1,0.25,1)] ${collapsed ? 'w-20' : 'w-48'} `}
       style={{
         width: sidebarWidthPx,
       }}
     >
-      {/* Toggle Button */}
+      {/*
+        Toggle Button. It is offset to straddle the sidebar right edge and so
+        overflows into the main content area. Because the sidebar uses a blur
+        backdrop it forms its own stacking context, which traps the low stacking
+        order of this button inside the sidebar. The parent z index lifts the
+        whole sidebar (and therefore this button) above the main content area,
+        so the overflowing half of the circle is no longer painted over and the
+        entire circle stays clickable.
+      */}
       <button
         onClick={() => setCollapsed(!collapsed)}
         className="hover:bg-accent-cyan absolute top-10 -right-3 z-20 rounded-full border border-white/10 bg-slate-800 p-1 text-white shadow-lg transition-colors outline-none hover:text-black focus:outline-none"
@@ -389,6 +412,24 @@ export const Sidebar: React.FC<SidebarProps> = ({
           );
         })}
       </nav>
+
+      {/* Profile selectors — global state controls (Stories 1.6 + 8.3 wiring,
+          Issue #104). Hidden in collapsed state because dropdowns can't fit
+          in the 80px column. Both write to electron-store so the choice
+          survives restart. */}
+      {!collapsed && (
+        <div className="border-glass-border flex flex-col gap-2 border-t px-3 py-3">
+          <ProfileSelector />
+          <ModelProfileSelector
+            liveModeActive={liveModeActive}
+            onSwitch={async (profile) => {
+              if (onSwitchModelProfile === undefined) return;
+              await onSwitchModelProfile(profile);
+            }}
+            onRejected={(reason) => toast.error(reason)}
+          />
+        </div>
+      )}
 
       {/* Bug Report - above the separator */}
       <div className="px-3 pb-2">

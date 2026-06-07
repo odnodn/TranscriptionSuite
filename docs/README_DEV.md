@@ -204,6 +204,7 @@ Technical documentation for developing and building TranscriptionSuite.
     - [13.5 Windows / macOS Docker Networking](#135-windows--macos-docker-networking)
     - [13.6 Checking Installed Packages](#136-checking-installed-packages)
     - [13.7 macOS DMG Build Failure (dmgbuild binary)](#137-macos-dmg-build-failure-dmgbuild-binary)
+    - [13.8 "Electron failed to install correctly" (Node version mismatch)](#138-electron-failed-to-install-correctly-node-version-mismatch)
   - [14. Dependencies](#14-dependencies)
     - [14.1 Server (Docker)](#141-server-docker)
     - [14.2 Dashboard](#142-dashboard)
@@ -359,7 +360,7 @@ TranscriptionSuite uses a **client-server architecture**:
 - **Dual VAD**: Real-time engine uses both Silero (neural) and WebRTC (algorithmic) VAD
 - **Multi-device support**: Multiple clients can connect, but only one transcription runs at a time
 - **Multi-backend STT**: Pluggable backend architecture - Whisper, NeMo Parakeet/Canary, WhisperX, VibeVoice-ASR, whisper.cpp (Vulkan), MLX (Apple Silicon: Whisper, Parakeet, Canary, VibeVoice) - auto-detected from the model name
-- **Live Mode**: Continuous sentence-by-sentence transcription with automatic model swapping to manage VRAM; Whisper backends only in v1
+- **Live Mode**: Continuous sentence-by-sentence transcription with automatic model swapping to manage VRAM; Whisper and whisper.cpp/GGML backends supported
 - **AI Assistant (OpenAI-compatible)**: Supports any OpenAI-compatible endpoint - LM Studio, Ollama, OpenAI, Groq, OpenRouter, and others. Configurable via Settings → AI tab with API key support, model selection, and endpoint URL. Per-conversation model overrides are available in the Notebook AI sidebar. Uses standard `/v1/chat/completions` with full conversation history
 
 ### 2.2 Platform Architectures
@@ -568,12 +569,12 @@ Keep these version fields aligned for a release:
 
 ### 4.1 Step 1: Environment Setup
 
-**Required Node.js version:** 25.7.0 - use [nvm](https://github.com/nvm-sh/nvm) and run `nvm use` inside `dashboard/` to activate the pinned version from `.nvmrc`.
+**Required Node.js version:** 22.22.3 (Node 22 LTS "Jod") - use [nvm](https://github.com/nvm-sh/nvm) and run `nvm use` inside `dashboard/` to activate the pinned version from `.nvmrc`. **Do not use Node 24 or 26** - they silently fail to unpack the Electron binary (see [§13.8](#138-electron-failed-to-install-correctly-node-version-mismatch)).
 
 ```bash
 # Dashboard (Node.js)
 cd dashboard
-nvm use   # activates Node 25.7.0 from .nvmrc
+nvm use   # activates Node 22.22.3 from .nvmrc
 npm install
 cd ..
 
@@ -705,7 +706,7 @@ Prerequisite: You must have built the image first (see Step 2).
 ### 5.1 Prerequisites
 
 ```bash
-# Dashboard: Node.js 25+ and npm
+# Dashboard: Node.js 22 LTS (22.22.3, pinned in .nvmrc) and npm
 cd dashboard && npm install
 
 # Server Python tools (linting, testing)
@@ -1430,12 +1431,15 @@ Key design decisions:
 
 #### Networking by Platform
 
-| Platform | Main container networking | whisper-server networking | URL used |
-|----------|--------------------------|--------------------------|----------|
-| Linux | `network_mode: host` | Bridge + port mapping | `http://localhost:8080` |
-| macOS | Bridge (Docker Desktop) | Bridge (same network) | `http://whisper-server:8080` |
-| Windows | Bridge (Docker Desktop) | Bridge (same network) | `http://whisper-server:8080` |
-| WSL2 | `network_mode: host` | Bridge + port mapping | `http://localhost:8080` |
+| Platform | Profile | Main container networking | whisper-server | URL used |
+|----------|---------|--------------------------|----------------|----------|
+| Linux | `vulkan` | `network_mode: host` | Docker sidecar + port mapping | `http://localhost:8080` |
+| macOS | (n/a) | Bridge (Docker Desktop) | (Vulkan unsupported) | (n/a) |
+| Windows (WSL2 backend) | `vulkan-wsl2` | Bridge (Docker Desktop) | Native `.exe` on Windows host | `http://host.docker.internal:8080` |
+| Windows + Hyper-V | (n/a) | Bridge (Docker Desktop) | (Vulkan unsupported) | (n/a) |
+| Native Linux WSL2 distro | `vulkan` | `network_mode: host` | Docker sidecar + port mapping | `http://localhost:8080` |
+
+> **`vulkan-wsl2` profile (Windows native-exe path).** On Windows the `vulkan-wsl2` runtime profile does **not** start a `whisper-server` Docker container. Instead, `dockerManager.ts::startContainer()` calls `launchWhisperServerNative()` to spawn `whisper-server.exe` directly on the Windows host. The exe is auto-downloaded from GitHub on first use to `%APPDATA%\TranscriptionSuite\whisper-server\whisper-server.exe`. The Docker backend (`docker-compose.yml` + `docker-compose.desktop-vm.yml` only — no Vulkan overlay) reaches the native exe at `http://host.docker.internal:8080`. A dedicated GHCR image repo (`ghcr.io/homelab-00/transcriptionsuite-server-vulkan-wsl2`) is used for all image operations when this profile is active. The profile is always surfaced on `win32` — the old alpine-based WSL2 GPU-passthrough probe was removed because the native-exe path does not consume `/dev/dxg`.
 
 The dashboard's `dockerManager.ts` automatically sets `WHISPERCPP_SERVER_URL` based on `process.platform` when the vulkan runtime profile is selected. The backend resolves the server URL with this priority:
 
@@ -1461,7 +1465,7 @@ whisper.cpp models have different capabilities compared to the default faster-wh
 | Translation (→ English) | Yes (except turbo) | Yes (except turbo/.en) | Canary only |
 | Speaker diarization | No (no pyannote) | Yes | Yes |
 | Word timestamps | Yes (token-level) | Yes | Yes |
-| Live mode | Not yet supported | Yes | Yes |
+| Live mode | Yes | Yes | Yes |
 
 #### Files
 
@@ -1480,8 +1484,7 @@ whisper.cpp models have different capabilities compared to the default faster-wh
 
 - **Single-worker**: whisper-server processes one request at a time. Concurrent transcription requests will queue.
 - **No diarization**: whisper.cpp has no pyannote integration. Speaker diarization is unavailable for GGML models.
-- **No live mode**: The sidecar architecture is not yet integrated with the live transcription engine.
-- **AMD GPU requirement**: Vulkan acceleration requires an AMD GPU with RADV support (RDNA1+) or an Intel GPU with ANV support. RDNA1 GPUs (e.g. RX 5500 XT) may need the `iommu=soft` kernel parameter.
+- **AMD/Intel GPU requirement**: Vulkan acceleration requires an AMD GPU with RADV support (RDNA1+) or an Intel GPU with ANV support. RDNA1 GPUs (e.g. RX 5500 XT) may need the `iommu=soft` kernel parameter.
 
 ### 6.10 Legacy-GPU image variant (Issue #83)
 
@@ -2441,7 +2444,6 @@ The existing `downloadModelToCache()` entry point detects GGML files via `isGgml
 
 #### Limitations
 
-- **No live mode** - the sidecar processes complete audio files; real-time streaming is not supported.
 - **No speaker diarization** - `supportsDiarization()` returns `false` for GGML models; pyannote integration is unavailable.
 - **No translation** for turbo variants - large-v3 and medium GGML models support translation; turbo variants do not.
 - **One model at a time** - model switching requires a server restart (sidecar loads model at startup).
@@ -2682,7 +2684,7 @@ The dashboard now uses model-first startup and additive dependency installs:
 
 ### 9.7 Package Management
 
-**Pinning strategy:** All direct dependencies in `dashboard/package.json` are pinned to exact versions (no `^` or `~`). This prevents silent version drift between environments and ensures the lock file remains stable across `npm install` runs. CI and the `.nvmrc` file pin Node.js to the same version used locally (25.7.0).
+**Pinning strategy:** All direct dependencies in `dashboard/package.json` are pinned to exact versions (no `^` or `~`). This prevents silent version drift between environments and ensures the lock file remains stable across `npm install` runs. CI and the `.nvmrc` file pin Node.js to the same version used locally (22.22.3).
 
 **Check for outdated packages:**
 ```bash
@@ -3360,6 +3362,65 @@ The `build-electron-mac.sh` script does this automatically. If you run `npm run 
 
 > This applies to the **thin** DMG path only. The bundled Metal DMG (`build-macos-metal` CI job) uses `hdiutil` directly and is unaffected.
 
+### 13.8 "Electron failed to install correctly" (Node version mismatch)
+
+**Issue**: `npm run dev:electron` (or any Electron run) throws:
+```
+Error: Electron failed to install correctly, please delete node_modules/electron and try installing again
+    at getElectronPath (.../node_modules/electron/index.js:17:11)
+```
+
+**Cause**: The `electron` npm package is a thin wrapper; its ~200 MB binary is fetched
+and unzipped by a `postinstall` script that writes `path.txt` **last**, only after a
+complete extract. Under certain Node.js versions, the bundled `extract-zip` silently
+unpacks only 2 of the binary's ~74 files, exits 0 **without error**, and never writes
+`path.txt` - so the wrapper throws. A plain `npm install` does not fix it: the same
+broken extract path re-runs and keeps "succeeding" while staying broken.
+
+The breakage is **Node-version-specific and non-monotonic** (verified empirically with
+Electron 40.x, 3 clean installs each):
+
+| Node.js | Result |
+|---------|--------|
+| **22.22.3** (LTS Jod) | ✅ works - **this is the pinned version** |
+| 24.16.0 (LTS Krypton) | ❌ broken (extracts 2/74 files) |
+| 25.7.0 | ✅ works |
+| 26.x | ❌ broken |
+
+Because newer is **not** safer (24 LTS is broken, 25 works), the project pins Node
+**22.22.3** in `dashboard/.nvmrc`, enforces it via `engines` (`">=22 <23"`) in
+`dashboard/package.json`, and uses it in all CI jobs. The common real-world trigger:
+the system Node (Arch ships a rolling, ahead-of-LTS Node) leaks in because nvm wasn't
+sourced or the pinned version wasn't installed, so `nvm use` silently fell through to it.
+
+**Fix**:
+```bash
+# 1. Make nvm available in your shell (Arch's nvm package does NOT auto-load it).
+#    Add to ~/.zshrc (or ~/.bashrc), then restart the shell:
+source /usr/share/nvm/init-nvm.sh
+
+# 2. Install + activate the pinned Node, then reinstall electron cleanly:
+cd dashboard
+nvm install            # installs the version from .nvmrc (22.22.3)
+nvm use                # activates it
+rm -rf node_modules/electron
+npm install
+```
+
+**Verify** the binary unpacked correctly:
+```bash
+cat node_modules/electron/path.txt                 # -> "electron" (not "No such file")
+ls node_modules/electron/dist | wc -l              # -> ~20 (not 2)
+node -e "console.log(require('electron'))"          # -> path to dist/electron
+```
+
+> **One-time, fully hands-off:** `nvm alias default 22.22.3` makes every new shell
+> default to the correct Node so you never have to think about it.
+
+> **Note:** only the **install** step is Node-sensitive (it unpacks the binary). Running
+> an already-installed Electron works under any Node, so `dev:electron` itself is fine
+> once `node_modules/electron` is correctly populated.
+
 ---
 
 ## 14. Dependencies
@@ -3378,7 +3439,7 @@ The `build-electron-mac.sh` script does this automatically. If you run `npm run 
 
 ### 14.2 Dashboard
 
-- Node.js 25.7.0 (pinned in `dashboard/.nvmrc` and CI)
+- Node.js 22.22.3 (Node 22 LTS; pinned in `dashboard/.nvmrc` and CI) - see [§13.8](#138-electron-failed-to-install-correctly-node-version-mismatch) for why not 24/26
 - Electron 40.8.5
 - React 19 + TypeScript 5.9
 - Vite 7 (bundler)

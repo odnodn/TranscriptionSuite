@@ -79,6 +79,36 @@ On first container start, the server installs Python dependencies into `/runtime
 
 **Timeout:** 30 minutes default (`BOOTSTRAP_TIMEOUT_SECONDS=1800`)
 
+### TLS interception / corporate network (`UnknownIssuer`)
+
+If first-run `uv sync` fails with `invalid peer certificate: UnknownIssuer` (or
+`certificate verify failed`), your network is intercepting HTTPS — a corporate
+proxy or antivirus "HTTPS scanning" feature presents a re-signed certificate
+whose root CA is trusted on your host but **not** inside the container. uv ships
+its own CA roots and ignores the system store by default, so it rejects the
+re-signed cert. The bootstrap now detects this and prints an actionable hint
+instead of a bare traceback.
+
+Fix (certificate verification stays ON — never disable it):
+
+1. **Trust the system CA store:** set `UV_NATIVE_TLS=true` (already wired into
+   `docker-compose.yml`). uv then reads the container's CA trust store instead
+   of its bundled roots.
+2. **Add your corporate root CA** so that store actually contains it. Easiest is
+   a small derived image:
+   ```dockerfile
+   FROM ghcr.io/homelab-00/transcriptionsuite-server:latest
+   COPY corp-root-ca.crt /usr/local/share/ca-certificates/corp-root-ca.crt
+   RUN update-ca-certificates
+   ```
+   Point `IMAGE_REPO`/`TAG` at your derived image and run with
+   `UV_NATIVE_TLS=true`. Alternatively, mount the CA and set
+   `SSL_CERT_FILE=/path/to/corp-root-ca.pem` in your own compose override.
+
+CPU-only hosts hit this most often because the default install pulls multi-GB
+CUDA wheels. Selecting the **CPU profile** in the dashboard (or
+`PYTORCH_VARIANT=cpu`) skips those wheels and shrinks the download surface.
+
 ## TLS / Remote Access
 
 ### Tailscale Setup
@@ -139,6 +169,24 @@ next bootstrap re-syncs wheels from the cu126 index.
 `--variant legacy` flips both the build-arg (`PYTORCH_VARIANT=cu126`) and the
 push target (`…/transcriptionsuite-server-legacy`). `latest` is auto-tagged
 only within its own repo, never across the two.
+
+**Post-push smoke check (mandatory on first push of a new package).**
+GHCR defaults first-push visibility to `Private`, which produces a 403 on
+anonymous pulls and misroutes in the dashboard. The script now prints a
+reminder on every push; on the **first** push of a newly created GHCR package
+(e.g. the initial `-legacy` publish for v1.3.3), flip the package to Public
+at `https://github.com/users/homelab-00/packages/container/<pkg>/settings`
+and then run the anonymous-pull smoke check from a shell with no GHCR creds:
+
+```bash
+docker logout ghcr.io
+docker pull ghcr.io/homelab-00/transcriptionsuite-server-legacy:v1.3.4
+```
+
+If the pull succeeds, the image is externally reachable. If it 403s, the
+package is still Private — fix visibility before announcing the release.
+This single step catches both the GHCR private-default failure mode *and*
+the "forgot to push one of the tags" variant.
 
 **Caveats:**
 - First-run bootstrap takes longer than the default variant — the legacy path
@@ -202,6 +250,8 @@ non-flipping cu129 path is zero-cost.
 | `INSTALL_WHISPER` | false | Install faster-whisper extras |
 | `INSTALL_NEMO` | false | Install NeMo toolkit |
 | `INSTALL_VIBEVOICE_ASR` | false | Install VibeVoice backend |
+| `PYTORCH_VARIANT` | cu129 | PyTorch wheels: `cu129`, `cu126` (legacy GPU), or `cpu` (no CUDA, GH #125) |
+| `UV_NATIVE_TLS` | false | Trust the system CA store for `uv` (corporate TLS interception, GH #125) |
 | `TLS_ENABLED` | false | Enable HTTPS + auth |
 | `LM_STUDIO_URL` | http://127.0.0.1:1234 | LM Studio API endpoint |
 
@@ -227,3 +277,59 @@ Triggered by `v*` tag push:
 2. **build-windows** — NSIS installer + GPG signature (3x retry)
 3. **build-macos** — DMG + ZIP + GPG signatures
 4. **create-release** — Draft GitHub Release with all artifacts
+
+## Keychain fallback (encrypted-file mode)
+
+The Audio Notebook QoL pack stores private profile fields (webhook tokens,
+API keys, custom auth headers) in the OS-native keychain by default —
+macOS Keychain, Windows DPAPI, or Linux libsecret. On hosts where no OS
+keychain is available (headless Docker, minimal Linux containers, CI
+runners), set the env flag below to enable an explicit file-encrypted
+fallback.
+
+### Enabling the fallback
+
+```bash
+KEYRING_BACKEND_FALLBACK=encrypted_file
+```
+
+The first time this flag is honoured, the server generates
+`secrets/master.key` (32 bytes, hex-encoded, mode 0600) and uses it as
+the password for `keyrings.alt.file.EncryptedKeyring`. Stored values
+land in `secrets/encrypted_keyring.cfg`.
+
+In Docker, bind-mount the `/secrets` directory so the key + encrypted
+store survive container rebuilds:
+
+```yaml
+volumes:
+  - ./secrets:/app/secrets
+```
+
+### Security delta — what the fallback DOES protect against
+
+- **Casual disk inspection** — values are AES-encrypted at rest; opening
+  `encrypted_keyring.cfg` in a text editor reveals nothing useful.
+- **Cloud-sync exposure** — if `secrets/` is excluded from your sync (as
+  it should be), the encrypted store never leaves the host.
+- **Database dumps** — private values are never in `notebook.db`.
+
+### Security delta — what the fallback does NOT protect against
+
+- **Local attacker with `secrets/master.key` access.** The master key is
+  stored unencrypted on the host filesystem. Any process that can read
+  the key file can decrypt every value in `encrypted_keyring.cfg`. The
+  OS-native keychain is the authoritative recommendation for desktop
+  installs because it does not have this property.
+- **Memory inspection.** Decrypted values pass through process memory
+  during use; this is true of any in-process secret store.
+- **Backup tooling that snapshots `secrets/`.** Treat `secrets/master.key`
+  as you would treat a password file: exclude from generic file-system
+  backups, or back up to an audited secret-management system instead.
+
+### Refusing the fallback
+
+If `KEYRING_BACKEND_FALLBACK` is NOT set and no OS keychain is available,
+the keychain wrapper raises `KeychainUnavailableError` with the
+deployment-guide pointer in the message — the server never silently
+stores secrets in plaintext (NFR8).

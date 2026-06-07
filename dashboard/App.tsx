@@ -11,6 +11,7 @@ import { SettingsModal } from './components/views/SettingsModal';
 import { AboutModal } from './components/views/AboutModal';
 import { BugReportModal } from './components/views/BugReportModal';
 import { StarPopupModal } from './components/views/StarPopupModal';
+import { DedupChoiceContainer } from './components/import/DedupChoiceContainer';
 import { Button } from './components/ui/Button';
 import { CustomSelect } from './components/ui/CustomSelect';
 import { QueryClientProvider } from '@tanstack/react-query';
@@ -33,6 +34,7 @@ import { useStarPopup } from './src/hooks/useStarPopup';
 import { useBootstrapDownloads } from './src/hooks/useBootstrapDownloads';
 import { useServerEventReactor } from './src/hooks/useServerEventReactor';
 import { useAuthTokenSync } from './src/hooks/useAuthTokenSync';
+import { useWatcherFilesBridge } from './src/hooks/useWatcherFilesBridge';
 import {
   MAIN_RECOMMENDED_MODEL,
   LIVE_RECOMMENDED_MODEL,
@@ -108,6 +110,10 @@ const AppInner: React.FC = () => {
   useAuthTokenSync(serverConnection.reachable, useRemote);
   // Bridge bootstrap log events → download store (runs regardless of active tab)
   useBootstrapDownloads();
+  // Singleton subscriber for the watcher:filesDetected IPC channel — must be
+  // mounted at app root so it does not double-register when a per-tab hook
+  // (e.g. useSessionWatcher) survives a tab switch (Issue #94).
+  useWatcherFilesBridge();
 
   // Track clientRunning at app level so Sidebar can derive Session status
   const [clientRunning, setClientRunning] = useState(false);
@@ -742,6 +748,22 @@ const AppInner: React.FC = () => {
         runtimeProfile={runtimeProfile}
         serverReachable={serverConnection.reachable}
         mlxProcessAlive={mlxProcessAlive}
+        liveModeActive={live.status !== 'idle' && live.status !== 'error'}
+        onSwitchModelProfile={async (profile) => {
+          // FR41 — apply the profile's STT model via the existing
+          // server.mainModelSelection config path (which the server
+          // config-watcher picks up to drive model_manager swap).
+          // Language selection stays manual until SessionView wiring
+          // (deferred for a follow-up sprint).
+          const api = (
+            window as {
+              electronAPI?: { config?: { set?: (k: string, v: unknown) => Promise<void> } };
+            }
+          ).electronAPI;
+          if (api?.config?.set !== undefined) {
+            await api.config.set('server.mainModelSelection', profile.sttModel);
+          }
+        }}
       />
 
       {/* Main Content Area */}
@@ -756,7 +778,10 @@ const AppInner: React.FC = () => {
         <QueuePausedBanner />
 
         {/* Scrollable View Content - Removed p-6 to allow full-width scrolling in Server View */}
-        <div className="relative h-full flex-1 overflow-hidden">
+        {/* @container: makes the content area a container-query context so SessionView/
+            NotebookView grids reflow based on available width (sidebar-collapse aware),
+            not viewport width. See spec-reduce-min-window-width-panel-reflow. */}
+        <div className="@container relative h-full flex-1 overflow-hidden">
           {/* SessionView stays mounted to preserve WebSocket/audio state across tab switches */}
           <div
             className="h-full w-full"
@@ -790,6 +815,11 @@ const AppInner: React.FC = () => {
       <BugReportModal isOpen={isBugReportOpen} onClose={() => setIsBugReportOpen(false)} />
       <StarPopupModal isOpen={showStarPopup} onDismiss={() => void dismissStarPopup()} />
 
+      {/* Issue #104, Sprint 2 Item 4 — full dedup choice flow.
+          The container subscribes to useDedupChoiceStore; the import queue
+          calls requestChoice() and awaits the user's pick before continuing. */}
+      <DedupChoiceContainer />
+
       {modelOnboardingOpen && (
         <div className="fixed inset-0 z-60 flex items-center justify-center p-4">
           <div
@@ -802,7 +832,7 @@ const AppInner: React.FC = () => {
               })
             }
           />
-          <div className="relative flex w-full max-w-lg flex-col overflow-hidden rounded-3xl border border-white/10 bg-black/60 shadow-2xl backdrop-blur-xl transition-all duration-500 ease-[cubic-bezier(0.32,0.72,0,1)]">
+          <div className="blur-panel relative flex w-full max-w-lg flex-col overflow-hidden rounded-3xl border border-white/10 bg-black/60 shadow-2xl backdrop-blur-xl transition-all duration-500 ease-[cubic-bezier(0.32,0.72,0,1)]">
             <div className="flex flex-none items-center justify-between border-b border-white/10 bg-white/5 px-6 py-4 select-none">
               <h2 className="text-lg font-semibold text-white">Choose Models Before Setup</h2>
             </div>
@@ -877,7 +907,7 @@ const AppInner: React.FC = () => {
             className="absolute inset-0 bg-black/60 backdrop-blur-sm transition-opacity duration-300 ease-in-out"
             onClick={() => resolveDependencyInstallPrompt(null)}
           />
-          <div className="relative flex w-full max-w-lg flex-col overflow-hidden rounded-3xl border border-white/10 bg-black/60 shadow-2xl backdrop-blur-xl transition-all duration-500 ease-[cubic-bezier(0.32,0.72,0,1)]">
+          <div className="blur-panel relative flex w-full max-w-lg flex-col overflow-hidden rounded-3xl border border-white/10 bg-black/60 shadow-2xl backdrop-blur-xl transition-all duration-500 ease-[cubic-bezier(0.32,0.72,0,1)]">
             <div className="flex flex-none items-center justify-between border-b border-white/10 bg-white/5 px-6 py-4 select-none">
               <h2 className="text-lg font-semibold text-white">Additional Dependencies Required</h2>
             </div>
@@ -914,7 +944,7 @@ const AppInner: React.FC = () => {
             className="absolute inset-0 bg-black/60 backdrop-blur-sm transition-opacity duration-300 ease-in-out"
             onClick={() => resolveHfPrompt({ action: 'cancel', token: '' })}
           />
-          <div className="relative flex w-full max-w-sm flex-col overflow-hidden rounded-3xl border border-white/10 bg-black/60 shadow-2xl backdrop-blur-xl transition-all duration-500 ease-[cubic-bezier(0.32,0.72,0,1)]">
+          <div className="blur-panel relative flex w-full max-w-sm flex-col overflow-hidden rounded-3xl border border-white/10 bg-black/60 shadow-2xl backdrop-blur-xl transition-all duration-500 ease-[cubic-bezier(0.32,0.72,0,1)]">
             <div className="flex flex-none items-center justify-between border-b border-white/10 bg-white/5 px-6 py-4 select-none">
               <h2 className="text-lg font-semibold text-white">Optional Diarization Setup</h2>
             </div>
@@ -992,7 +1022,7 @@ const AppInner: React.FC = () => {
             className="absolute inset-0 bg-black/60 backdrop-blur-sm transition-opacity duration-300 ease-in-out"
             onClick={() => resolveRemoteProfilePrompt({ action: 'cancel', profile: 'tailscale' })}
           />
-          <div className="relative flex w-full max-w-lg flex-col overflow-hidden rounded-3xl border border-white/10 bg-black/60 shadow-2xl backdrop-blur-xl transition-all duration-500 ease-[cubic-bezier(0.32,0.72,0,1)]">
+          <div className="blur-panel relative flex w-full max-w-lg flex-col overflow-hidden rounded-3xl border border-white/10 bg-black/60 shadow-2xl backdrop-blur-xl transition-all duration-500 ease-[cubic-bezier(0.32,0.72,0,1)]">
             <div className="flex flex-none items-center justify-between border-b border-white/10 bg-white/5 px-6 py-4 select-none">
               <h2 className="text-lg font-semibold text-white">Remote Connection Profile</h2>
             </div>
