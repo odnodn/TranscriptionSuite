@@ -1,0 +1,35 @@
+# DGX Spark (Blackwell GB10) GPU overlay
+# Designed for NVIDIA DGX Spark with GB10 GPU (sm_121, ARM64, CUDA 13.0).
+#
+# Usage with Approach A (NGC base image):
+#   docker compose -f docker-compose.yml \
+#     -f docker-compose.linux-host.yml \
+#     -f docker-compose.gpu-dgx-spark.yml up -d
+#
+# Usage with Approach B (ubuntu base + cu130 variant):
+#   PYTORCH_VARIANT=cu130 docker compose -f docker-compose.yml \
+#     -f docker-compose.linux-host.yml \
+#     -f docker-compose.gpu-dgx-spark.yml up -d
+#
+# See docs/dgx-spark-deployment.md for full deployment instructions.
+
+services:
+  transcriptionsuite:
+    build:
+      context: ../..
+      dockerfile: server/docker/Dockerfile.dgx-spark
+      args:
+        PYTORCH_VARIANT: ${PYTORCH_VARIANT:-ngc}
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      # Blackwell architecture target (also set in Dockerfile.dgx-spark ENV;
+      # compose value takes precedence, keeping it explicit here for clarity)
+      - TORCH_CUDA_ARCH_LIST=12.1
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]

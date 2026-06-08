@@ -63,7 +63,13 @@ chown -R appuser:appuser /data /models /runtime
 # Bootstrap runtime dependencies and feature status.
 log "Bootstrapping runtime environment..."
 BOOTSTRAP_START_NS="$(date +%s%N)"
-gosu appuser /usr/bin/python3.13 docker/bootstrap_runtime.py
+# Prefer python3.13 (default Dockerfile); fall back to python3 for NGC images
+# that ship a different Python version (e.g. python3.12).
+BOOTSTRAP_PYTHON="/usr/bin/python3.13"
+if [ ! -x "$BOOTSTRAP_PYTHON" ]; then
+    BOOTSTRAP_PYTHON="$(command -v python3)"
+fi
+gosu appuser "$BOOTSTRAP_PYTHON" docker/bootstrap_runtime.py
 BOOTSTRAP_END_NS="$(date +%s%N)"
 BOOTSTRAP_ELAPSED_MS="$(( (BOOTSTRAP_END_NS - BOOTSTRAP_START_NS) / 1000000 ))"
 BOOTSTRAP_ELAPSED_S="$(( BOOTSTRAP_ELAPSED_MS / 1000 ))"

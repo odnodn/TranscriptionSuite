@@ -424,10 +424,27 @@ def run_dependency_sync(
     # back to PyPI (Issue #115).
     variant_index_urls = {
         "cu126": "https://download.pytorch.org/whl/cu126",
+        "cu130": "https://download.pytorch.org/whl/cu130",
         "cpu": "https://download.pytorch.org/whl/cpu",
     }
     index_url = variant_index_urls.get(pytorch_variant)
-    if index_url is not None:
+    if pytorch_variant == "ngc":
+        # NGC variant: PyTorch is pre-installed in the NGC base image
+        # (nvcr.io/nvidia/pytorch). Skip frozen lock (torch hashes won't match)
+        # and use unsafe-best-match so non-torch packages resolve from PyPI.
+        # The name "pytorch-cu129" is reused intentionally — it's the named index
+        # pinned by [tool.uv.sources] in pyproject.toml. Reusing the name redirects
+        # the source pin's URL so uv doesn't error when resolving the torch entry.
+        log("NGC variant: torch/torchaudio provided by base image — syncing remaining deps only")
+        cmd.extend(
+            [
+                "--index",
+                f"pytorch-cu129=https://download.pytorch.org/whl/cu130",
+                "--index-strategy",
+                "unsafe-best-match",
+            ]
+        )
+    elif index_url is not None:
         cmd.extend(
             [
                 "--index",
@@ -1504,7 +1521,7 @@ def main() -> int:
     raw_variant = (os.environ.get("PYTORCH_VARIANT") or "").strip().lower()
     if raw_variant in {"", "cu129"}:
         pytorch_variant = "cu129"
-    elif raw_variant in {"cu126", "cpu"}:
+    elif raw_variant in {"cu126", "cu130", "cpu", "ngc"}:
         pytorch_variant = raw_variant
     else:
         log(f"Unknown PYTORCH_VARIANT={raw_variant!r}; falling back to cu129")

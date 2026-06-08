@@ -8,6 +8,8 @@ FROM ubuntu:24.04 AS runtime
 # PyTorch wheel-index variant (Issue #83):
 #   cu129 (default) — modern GPUs, sm_70..sm_120 (Volta and newer)
 #   cu126           — legacy-GPU image, sm_50..sm_90 (restores Pascal/Maxwell, e.g. GTX 1070)
+#   cu130           — Blackwell GPUs, sm_121 (DGX Spark GB10, ARM64)
+#   ngc             — NGC base image variant (see Dockerfile.dgx-spark)
 # Selected at build time via `--build-arg PYTORCH_VARIANT=cu126` and consumed by
 # bootstrap_runtime.py to switch the `uv sync` index. Default = cu129 keeps existing
 # behaviour byte-identical for unchanged builds.
