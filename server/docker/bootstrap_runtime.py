@@ -432,6 +432,9 @@ def run_dependency_sync(
         # NGC variant: PyTorch is pre-installed in the NGC base image
         # (nvcr.io/nvidia/pytorch). Skip frozen lock (torch hashes won't match)
         # and use unsafe-best-match so non-torch packages resolve from PyPI.
+        # The name "pytorch-cu129" is reused intentionally — it's the named index
+        # pinned by [tool.uv.sources] in pyproject.toml. Reusing the name redirects
+        # the source pin's URL so uv doesn't error when resolving the torch entry.
         log("NGC variant: torch/torchaudio provided by base image — syncing remaining deps only")
         cmd.extend(
             [

@@ -23,7 +23,8 @@ services:
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
-      # Blackwell architecture target
+      # Blackwell architecture target (also set in Dockerfile.dgx-spark ENV;
+      # compose value takes precedence, keeping it explicit here for clarity)
       - TORCH_CUDA_ARCH_LIST=12.1
     deploy:
       resources:
