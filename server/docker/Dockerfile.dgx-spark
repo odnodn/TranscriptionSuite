@@ -1,0 +1,105 @@
+# TranscriptionSuite — DGX Spark (Blackwell ARM64) Dockerfile
+#
+# Uses the NVIDIA NGC PyTorch container as the base image.
+# PyTorch, CUDA 13.0, cuDNN, and NCCL are pre-installed for ARM64 + sm_121.
+# Application dependencies are installed at first container startup into /runtime/.venv.
+#
+# Build:
+#   docker build -t transcriptionsuite-server:dgx-spark -f server/docker/Dockerfile.dgx-spark .
+#
+# See docs/dgx-spark-deployment.md for full deployment instructions.
+
+FROM nvcr.io/nvidia/pytorch:25.11-py3 AS runtime
+
+# Mark this as the NGC / DGX Spark variant. The bootstrap script recognises "ngc"
+# and skips PyTorch wheel installation (torch is pre-installed in the base image).
+ARG PYTORCH_VARIANT=ngc
+
+# OCI standard labels
+LABEL org.opencontainers.image.title="TranscriptionSuite Server (DGX Spark)"
+LABEL org.opencontainers.image.description="TranscriptionSuite server for NVIDIA DGX Spark (Blackwell ARM64, CUDA 13.0, NGC PyTorch base)"
+LABEL org.opencontainers.image.authors="homelab-00"
+LABEL org.opencontainers.image.vendor="homelab-00"
+LABEL org.opencontainers.image.source="https://github.com/homelab-00/TranscriptionSuite"
+LABEL org.opencontainers.image.url="https://github.com/homelab-00/TranscriptionSuite"
+LABEL org.opencontainers.image.documentation="https://github.com/homelab-00/TranscriptionSuite/blob/main/docs/dgx-spark-deployment.md"
+LABEL org.opencontainers.image.licenses="GPL-3.0-or-later"
+
+# Global environment
+ENV DEBIAN_FRONTEND="noninteractive"
+ENV PYTHONUNBUFFERED="1"
+ENV PYTHONDONTWRITEBYTECODE="1"
+# NGC 25.11-py3 ships Python 3.12; align UV_PYTHON with what the base provides.
+ENV UV_PYTHON="3.12"
+ENV PYTORCH_VARIANT="${PYTORCH_VARIANT}"
+ENV BOOTSTRAP_RUNTIME_DIR="/runtime"
+ENV BOOTSTRAP_CACHE_DIR="/runtime/cache"
+ENV BOOTSTRAP_STATUS_FILE="/runtime/bootstrap-status.json"
+ENV BOOTSTRAP_TIMEOUT_SECONDS="1800"
+ENV BOOTSTRAP_REQUIRE_HF_TOKEN="false"
+ENV BOOTSTRAP_LOG_CHANGES="true"
+ENV UV_CACHE_DIR="/runtime/cache"
+ENV HF_HOME="/models"
+ENV TORCH_HOME="/models/torch-cache"
+# Suppress the torchcodec/pyannote UserWarning at the interpreter level.
+ENV PYTHONWARNINGS="ignore::UserWarning:pyannote.audio.core.io"
+
+# Install additional runtime dependencies not present in the NGC image.
+# The NGC image already provides: Python, git, curl, build-essential, CUDA libs.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg \
+    libsndfile1 \
+    libportaudio2 \
+    portaudio19-dev \
+    gosu \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install uv (fast Python package manager)
+RUN curl -LsSf https://astral.sh/uv/0.10.8/install.sh | env UV_UNMANAGED_INSTALL="/usr/local/bin" sh
+
+# Create non-root user for security with pinned UID/GID
+RUN groupadd -g 10000 appuser && \
+    useradd -u 10000 -g 10000 -m -s /bin/bash appuser
+
+# Create app directory
+WORKDIR /app
+
+# Copy server application code and bootstrap tooling.
+COPY --chown=appuser:appuser server/backend/ ./server/
+COPY --chown=appuser:appuser server/docker/entrypoint.py ./docker/
+COPY --chown=appuser:appuser server/docker/bootstrap_runtime.py ./docker/
+COPY server/docker/docker-entrypoint.sh ./docker/
+RUN chmod 700 ./docker/docker-entrypoint.sh
+
+# Copy default configuration
+COPY server/config.yaml ./config.yaml
+
+# Bake the variant identifier so bootstrap_runtime.py can verify at runtime.
+RUN printf '%s\n' "${PYTORCH_VARIANT}" > /app/.pytorch_variant && \
+    chown appuser:appuser /app/.pytorch_variant && \
+    chmod 0644 /app/.pytorch_variant
+
+# Create data directories with correct permissions
+RUN mkdir -p /data/database /data/audio /data/logs /data/tokens /data/certs /models /user-config /certs /runtime /runtime/cache && \
+    chown -R appuser:appuser /data /models /user-config /runtime
+
+# Environment variables
+ENV DATA_DIR="/data"
+ENV SERVER_HOST="0.0.0.0"
+ENV SERVER_PORT="9786"
+ENV LOG_LEVEL="INFO"
+# NGC base already sets LD_LIBRARY_PATH for CUDA/cuDNN; extend for runtime venv.
+# The entrypoint dynamically adjusts this at startup (docker-entrypoint.sh lines 89-117).
+ENV LD_LIBRARY_PATH="/runtime/.venv/lib/python3.12/site-packages/torch/lib:${LD_LIBRARY_PATH}"
+ENV PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True,garbage_collection_threshold:0.8"
+
+# Expose port
+EXPOSE 9786
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=600s --retries=3 \
+    CMD curl -f http://localhost:${SERVER_PORT}/health || exit 1
+
+# Shell entrypoint handles TLS cert permissions then drops to appuser
+ENTRYPOINT ["./docker/docker-entrypoint.sh"]
+CMD []
