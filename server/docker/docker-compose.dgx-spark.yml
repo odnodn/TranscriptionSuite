@@ -1,0 +1,22 @@
+# DGX Spark compose overlay
+# Uses the DGX Spark-specific Dockerfile (nvcr.io/nvidia/pytorch base with sm_121 support).
+# Overrides the build context and image tag for DGX Spark (Blackwell GB10, aarch64).
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.linux-host.yml \
+#                  -f docker-compose.gpu.yml -f docker-compose.dgx-spark.yml up -d
+#
+# Or build locally:
+#   docker compose -f docker-compose.yml -f docker-compose.dgx-spark.yml build
+
+services:
+  transcriptionsuite:
+    build:
+      context: ../..
+      dockerfile: server/docker/Dockerfile.dgx-spark
+      args:
+        BASE_IMAGE: ${DGX_BASE_IMAGE:-nvcr.io/nvidia/pytorch:25.09-py3}
+        PYTORCH_VARIANT: dgx-spark
+    image: ${IMAGE_REPO:-ghcr.io/homelab-00/transcriptionsuite-server}:${TAG:-dgx-spark}
+    environment:
+      - PYTORCH_VARIANT=dgx-spark
