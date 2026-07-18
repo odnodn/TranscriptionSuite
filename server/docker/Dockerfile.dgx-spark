@@ -14,7 +14,7 @@
 # Adapted from nemotron-asr-server (https://github.com/briancaffey/nemotron-asr-server)
 # — base image selection pattern for DGX Spark sm_121 aarch64 support.
 #
-# Build:
+# Build (from the repository root):
 #   docker build -f server/docker/Dockerfile.dgx-spark -t transcriptionsuite-server:dgx-spark .
 #
 # Usage with compose:

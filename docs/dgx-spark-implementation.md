@@ -2,7 +2,7 @@
 
 > **Status:** Planning  
 > **Target platform:** NVIDIA DGX Spark — Blackwell GB10 (sm_121), aarch64, CUDA 12.x  
-> **Issue:** [#1](https://github.com/odnodn/TranscriptionSuite/issues/1)
+> **Issue:** [#1](https://github.com/homelab-00/TranscriptionSuite/issues/1)
 
 ---
 
@@ -223,7 +223,7 @@ DGX_BASE_IMAGE=nvcr.io/nvidia/pytorch:25.06-py3 \
 
 1. **Multi-arch image manifest:** Publish a single `transcriptionsuite-server:latest` that resolves to the correct image per architecture (amd64 → ubuntu base, arm64 → NGC base). Requires a CI matrix build.
 
-2. **NGC base image version pinning:** The `25.09-py3` tag will age. Add a CI job that tests against the latest NGC monthly release.
+2. **NGC base image version pinning:** The `25.09-py3` tag will age. Add a CI job that tests against the latest NGC monthly release. When upgrading, check the Python version shipped in the new tag and update `UV_PYTHON` in the Dockerfile if it changes. NGC tags follow a `YY.MM-py3` convention; prefer LTS-aligned quarterly updates (e.g. `25.09`, `26.01`, `26.05`).
 
 3. **NeMo integration:** The DGX Spark is a natural fit for NVIDIA Parakeet ASR models via NeMo. The `INSTALL_NEMO=true` flag should work out of the box since NeMo's dependencies are partially satisfied by the NGC base.
 
